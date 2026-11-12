@@ -266,3 +266,26 @@ fn void alias_in_reset_on_reconnect() @test
 	assert(@catch(s.core.input(s.clock.now, only_alias)) == mqtt::TOPIC_ALIAS_INVALID, "the binding of the old connection is gone");
 	s.close();
 }
+
+// the least recently used alias is reused even when several uses happen at the same instant
+fn void alias_out_lru_same_instant() @test
+{
+	Session s;
+	Config c = cfg();
+	c.auto_topic_alias = true;
+	s.open(&c, CONNACK_ALIAS_2);
+	String[4] topics = { "a", "b", "a", "c" };
+	String[4] expected = {
+		"30 07 00 01 61 03 23 00 01",       // a: alias 1
+		"30 07 00 01 62 03 23 00 02",       // b: alias 2
+		"30 06 00 00 03 23 00 01",          // a: only the alias, used after b
+		"30 07 00 01 63 03 23 00 02",       // c: b was used least recently, so it gives up alias 2
+	};
+	for (usz i = 0; i < 4; i++)
+	{
+		OutMessage m = { .topic = topics[i], .qos = QoS.AT_MOST_ONCE };
+		s.core.publish(s.clock.now, &m)!!;                       // the clock does not move
+		harness::expect_out(&s.core, expected[i]);
+	}
+	s.close();
+}

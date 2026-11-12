@@ -221,6 +221,7 @@ struct Core
 	List{ushort} in_qos2;           // inbound QoS 2 ids between PUBLISH and PUBREL
 	List{AliasEntry} alias_in;      // server -> topic, owned copies
 	List{AliasEntry} alias_out;     // topic -> alias, owned copies
+	ulong alias_clock;              // counts alias uses: the order of use, however coarse the time is
 	List{char} topics;              // topics of events that were resolved from an alias, until the events are taken
 	ushort next_id;
 	Duration last_now;              // latest time seen, for the "never goes back" rule
@@ -260,7 +261,7 @@ struct Inflight
 
 enum PendingKind : char { SUBSCRIBE, UNSUBSCRIBE }
 struct PendingAck { ushort id; PendingKind kind; usz count; }
-struct AliasEntry { ushort alias_id; String topic; Duration last_used; }
+struct AliasEntry { ushort alias_id; String topic; ulong used; }
 
 // A queued event. The frame it came from stays in in_buf until the queue is drained.
 struct EventRec
@@ -1362,7 +1363,7 @@ fn AliasPlan Core.plan_alias(&self, String topic, ushort explicit, bool auto)
 	sz lru = 0;
 	for (sz i = 1; i < self.alias_out.len(); i++)
 	{
-		if (self.alias_out.entries[i].last_used < self.alias_out.entries[lru].last_used) lru = i;
+		if (self.alias_out.entries[i].used < self.alias_out.entries[lru].used) lru = i;
 	}
 	plan.alias_no = self.alias_out.entries[lru].alias_id;
 	plan.replaces = lru;
@@ -1382,6 +1383,7 @@ fn void apply_alias(Publish* u, AliasPlan* plan)
 fn void Core.commit_alias(&self, Duration now, AliasPlan* plan, String topic)
 {
 	if (plan.alias_no == 0) return;
+	self.alias_clock++;
 	if (plan.new_binding)
 	{
 		String copy = topic.copy(self.allocator);
@@ -1389,16 +1391,16 @@ fn void Core.commit_alias(&self, Duration now, AliasPlan* plan, String topic)
 		{
 			self.alias_out.entries[plan.replaces].topic.free(self.allocator);
 			self.alias_out.entries[plan.replaces].topic = copy;
-			self.alias_out.entries[plan.replaces].last_used = now;
+			self.alias_out.entries[plan.replaces].used = self.alias_clock;
 		}
 		else
 		{
-			self.alias_out.push({ .alias_id = plan.alias_no, .topic = copy, .last_used = now });
+			self.alias_out.push({ .alias_id = plan.alias_no, .topic = copy, .used = self.alias_clock });
 		}
 		return;
 	}
 	sz at = self.find_alias_out(plan.alias_no);
-	if (at >= 0) self.alias_out.entries[at].last_used = now;
+	if (at >= 0) self.alias_out.entries[at].used = self.alias_clock;
 }
 
 // ---- session state across connections ----
