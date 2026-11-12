@@ -319,3 +319,39 @@ fn void alias_in_alias_only_messages_share_the_topic_copy() @test
 	assert(n == 1001);
 	s.close();
 }
+
+// an alias chosen by the core is dropped when it would make the packet larger than the server accepts
+fn void auto_alias_respects_the_server_packet_limit() @test
+{
+	// alias maximum 5, Maximum Packet Size 32: a QoS 1 message of exactly 32 bytes has no room for the alias
+	Session s;
+	Config c = cfg();
+	c.auto_topic_alias = true;
+	s.open(&c, "20 0B 00 00 08 22 00 05 27 00 00 00 20");
+	char[] payload = mem::temp_array(char, 24);
+	payload[..] = 'p';
+	OutMessage m = { .topic = "t", .payload = payload, .qos = QoS.AT_LEAST_ONCE };
+	s.core.publish(s.clock.now, &m)!!;
+	char[] out = s.core.pending_output();
+	assert(out.len == 32, "not larger than the server takes");
+	Packet p = packet::decode(Version.V5, out)!!;
+	assert(!p.publish.props.has(PropId.TOPIC_ALIAS) && p.publish.topic == "t");
+	s.core.output_done(out.len);
+	s.close();
+	// the same for a message that waited in the queue
+	Session t;
+	Config d = cfg();
+	d.auto_topic_alias = true;
+	t.open(&d, "20 0E 00 00 0B 21 00 01 22 00 05 27 00 00 00 20");
+	OutMessage small = { .topic = "t", .qos = QoS.AT_LEAST_ONCE };
+	t.core.publish(t.clock.now, &small)!!;
+	assert(t.core.publish(t.clock.now, &m)!! == 0);
+	t.core.output_done(t.core.pending_output().len);
+	harness::feed(&t.core, &t.clock, "40 02 00 01");
+	char[] queued = t.core.pending_output();
+	assert(queued.len == 32);
+	Packet q = packet::decode(Version.V5, queued)!!;
+	assert(!q.publish.props.has(PropId.TOPIC_ALIAS));
+	t.core.output_done(queued.len);
+	t.close();
+}

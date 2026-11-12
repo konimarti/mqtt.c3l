@@ -1514,7 +1514,7 @@ fn void? Core.resend_pending(&self, Duration now)
 			ReasonCode refused = ReasonCode.SUCCESS;
 			Packet p;
 			AliasPlan plan = { .replaces = -1 };
-			self.fill_publish(now, r, true, &p, &plan)!;
+			self.fill_fitting(now, r, true, &p, &plan)!;
 			if (r.qos.ordinal > self.limits.maximum_qos.ordinal)
 			{
 				refused = ReasonCode.QOS_NOT_SUPPORTED;
@@ -1615,7 +1615,7 @@ fn uint Core.remaining_expiry(&self, Duration now, Inflight* r)
 
 // The PUBLISH packet of a record (borrowing from its block): the Message Expiry Interval, if there is
 // one, becomes the time left.
-fn void? Core.fill_publish(&self, Duration now, Inflight* r, bool dup, Packet* p, AliasPlan* plan)
+fn void? Core.fill_publish(&self, Duration now, Inflight* r, bool dup, Packet* p, AliasPlan* plan, bool with_alias)
 {
 	*p = { .type = PacketType.PUBLISH };
 	Publish* u = &p.publish;
@@ -1630,9 +1630,18 @@ fn void? Core.fill_publish(&self, Duration now, Inflight* r, bool dup, Packet* p
 		ByteReader rd = wire::reader(r.block[r.topic_len + r.payload_len..]);
 		u.props = rd.properties(PropContext.PUBLISH)!;
 		if (r.expiry_s != 0) u.props.message_expiry = self.remaining_expiry(now, r);
-		*plan = self.plan_alias(u.topic, r.alias_no, r.auto_alias);
+		*plan = with_alias ? self.plan_alias(u.topic, r.alias_no, r.auto_alias) : (AliasPlan){ .replaces = -1 };
 		apply_alias(u, plan);
 	}
+}
+
+// As fill_publish, but an alias that would make the packet larger than the server's Maximum Packet Size is left out.
+fn void? Core.fill_fitting(&self, Duration now, Inflight* r, bool dup, Packet* p, AliasPlan* plan)
+{
+	self.fill_publish(now, r, dup, p, plan, true)!;
+	if (self.limits.max_packet_size == 0 || plan.alias_no == 0) return;
+	usz size = packet::encoded_size(self.config.version, p)!;
+	if (size > self.limits.max_packet_size) self.fill_publish(now, r, dup, p, plan, false)!;
 }
 
 // (Re)sends the PUBLISH of a record.
@@ -1640,7 +1649,7 @@ fn void? Core.send_record(&self, Duration now, Inflight* r, bool dup)
 {
 	Packet p;
 	AliasPlan plan = { .replaces = -1 };
-	self.fill_publish(now, r, dup, &p, &plan)!;
+	self.fill_fitting(now, r, dup, &p, &plan)!;
 	self.queue_packet(now, &p)!;
 	self.commit_alias(now, &plan, (String)r.block[:r.topic_len]);
 }
@@ -1702,7 +1711,7 @@ fn void? Core.drain_queue(&self, Duration now)
 		r.id = 1;
 		Packet p;
 		AliasPlan plan = { .replaces = -1 };
-		self.fill_publish(now, &r, false, &p, &plan)!;
+		self.fill_fitting(now, &r, false, &p, &plan)!;
 		if (!self.has_room(packet::encoded_size(self.config.version, &p)!))
 		{
 			self.flow_stalled = true;                      // back pressure: it stays queued
