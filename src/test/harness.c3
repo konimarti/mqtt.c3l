@@ -1,5 +1,5 @@
 module mqtt::harness;
-import mqtt, mqtt::core, mqtt::testutil, std::time;
+import mqtt, mqtt::core, mqtt::testutil, std::core::mem::allocators, std::time;
 
 // Helpers for tests that drive the session core from the outside: virtual monotonic time, a hex
 // script for what the core must write, and bytes fed to it in pieces. No sockets, no real time.
@@ -70,4 +70,47 @@ fn EventKind[] drain(Core* core)
 	Event ev;
 	while (core.poll_event(&ev) && n < kinds.len) kinds[n++] = ev.kind;
 	return kinds[:n];
+}
+
+// A core on a tracking allocator with virtual time: open() connects and accepts, close() frees the core and
+// requires that nothing is left allocated.
+struct Session
+{
+	TrackingAllocator mem_track;
+	Core core;
+	VirtualClock clock;
+}
+
+// Starts the core, connects, takes the CONNECT bytes and accepts the connection with `connack_hex`.
+fn void Session.open(&self, Config* c, String connack_hex)
+{
+	self.mem_track.init(mem);
+	self.core.init(&self.mem_track, c)!!;
+	self.core.connect(self.clock.now)!!;
+	self.core.output_done(self.core.pending_output().len);
+	feed(&self.core, &self.clock, connack_hex);
+	EventKind[] kinds = drain(&self.core);
+	assert(kinds.len == 1 && kinds[0] == EventKind.CONNECTED, "the CONNACK was accepted");
+}
+
+fn void Session.close(&self)
+{
+	self.core.free();
+	assert(self.mem_track.allocation_count() == 0, "the core released everything");
+	self.mem_track.free();
+}
+
+// Moves the virtual time to ms milliseconds since the start (never backwards).
+fn void Session.at(&self, long ms)
+{
+	assert(time::ms(ms) >= self.clock.now);
+	self.clock.now = time::ms(ms);
+}
+
+// The next event; one must be waiting.
+fn Event Session.take(&self)
+{
+	Event ev;
+	assert(self.core.poll_event(&ev), "an event is waiting");
+	return ev;
 }
