@@ -16,7 +16,7 @@ MQTT 3.1.1 and 5.0 client for C3. One library, the protocol level is chosen when
 
 ## Client
 
-Publish one message (this is the whole program apart from the imports):
+Publish one message (a function to call from your own `main`):
 
 ```c3
 import mqtt, mqtt::client, mqtt::core, mqtt::tcp, mqtt::transport;
@@ -201,7 +201,8 @@ library:
 
 `c3c test` runs the unit tests: codec fixtures written from the specification, scripted sessions of the core with a virtual
 clock, mutation fuzzing of the codec and the core, the blocking client over an in-memory transport and over loopback sockets.
-No broker, no network apart from loopback. Leaks are checked with a tracking allocator.
+No broker, no network apart from loopback. Leaks are checked with a tracking allocator. The formatting (`c3f --check`) is checked
+locally, not in CI.
 
 ## Out of scope
 
