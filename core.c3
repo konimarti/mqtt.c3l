@@ -221,7 +221,7 @@ struct Core
 	List{ushort} in_qos2;           // inbound QoS 2 ids between PUBLISH and PUBREL
 	List{AliasEntry} alias_in;      // server -> topic, owned copies
 	List{AliasEntry} alias_out;     // topic -> alias, owned copies
-	ulong alias_clock;              // counts alias uses: the order of use, however coarse the time is
+	ulong alias_uses;              // counts alias uses: the order of use, however coarse the time is
 	List{char} topics;              // topics of events that were resolved from an alias, until the events are taken
 	ushort next_id;
 	Duration last_now;              // latest time seen, for the "never goes back" rule
@@ -715,7 +715,7 @@ fn void? Core.handle_suback(&self, Duration now, usz off, usz n, Packet* p)
 		self.pending.remove_at(i);
 		self.release_id(pa.id);
 		EventKind ek = kind == PendingKind.SUBSCRIBE ? EventKind.SUBSCRIBED : EventKind.UNSUBSCRIBED;
-		self.events.push({ .kind = ek, .frame_off = off, .frame_len = n });
+		self.events.push({ .kind = ek, .frame_off = off, .frame_len = n, .packet_id = a.packet_id });
 		return;
 	}
 }
@@ -850,6 +850,41 @@ fn bool Core.poll_event(&self, Event* ev)
 		self.events.clear();
 		self.event_head = 0;
 	}
+	self.build_event(&rec, ev);
+	return true;
+}
+
+// The first undelivered event of this kind (with this packet id, when id is not 0), taken out of the
+// queue while the others stay in their order. For adapters that wait for one answer without losing the
+// events that arrive meanwhile.
+fn bool Core.poll_matching(&self, EventKind kind, ushort id, Event* ev)
+{
+	for (sz i = self.event_head; i < self.events.len(); i++)
+	{
+		EventRec rec = self.events.entries[i];
+		if (rec.kind != kind) continue;
+		if (id != 0 && rec.packet_id != id) continue;
+		self.events.remove_at(i);
+		if (self.event_head >= self.events.len())
+		{
+			self.events.clear();
+			self.event_head = 0;
+		}
+		self.build_event(&rec, ev);
+		return true;
+	}
+	return false;
+}
+
+// The packet id of the record that was sent last (0 if nothing is in flight).
+fn ushort Core.last_inflight_id(&self)
+{
+	if (self.inflight.len() == 0) return 0;
+	return self.inflight.entries[self.inflight.len() - 1].id;
+}
+
+fn void Core.build_event(&self, EventRec* rec, Event* ev)
+{
 	*ev = { .kind = rec.kind };
 	switch (rec.kind)
 	{
@@ -916,7 +951,6 @@ fn bool Core.poll_event(&self, Event* ev)
 		default:
 			break;
 	}
-	return true;
 }
 
 // ---- timers ----
@@ -1420,7 +1454,7 @@ fn void apply_alias(Publish* u, AliasPlan* plan)
 fn void Core.commit_alias(&self, Duration now, AliasPlan* plan, String topic)
 {
 	if (plan.alias_no == 0) return;
-	self.alias_clock++;
+	self.alias_uses++;
 	if (plan.new_binding)
 	{
 		String copy = topic.copy(self.allocator);
@@ -1428,16 +1462,16 @@ fn void Core.commit_alias(&self, Duration now, AliasPlan* plan, String topic)
 		{
 			self.alias_out.entries[plan.replaces].topic.free(self.allocator);
 			self.alias_out.entries[plan.replaces].topic = copy;
-			self.alias_out.entries[plan.replaces].used = self.alias_clock;
+			self.alias_out.entries[plan.replaces].used = self.alias_uses;
 		}
 		else
 		{
-			self.alias_out.push({ .alias_id = plan.alias_no, .topic = copy, .used = self.alias_clock });
+			self.alias_out.push({ .alias_id = plan.alias_no, .topic = copy, .used = self.alias_uses });
 		}
 		return;
 	}
 	sz at = self.find_alias_out(plan.alias_no);
-	if (at >= 0) self.alias_out.entries[at].used = self.alias_clock;
+	if (at >= 0) self.alias_out.entries[at].used = self.alias_uses;
 }
 
 // ---- session state across connections ----
