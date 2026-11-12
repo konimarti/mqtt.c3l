@@ -28,6 +28,7 @@ faultdef
 	NOT_SUPPORTED_BY_SERVER, // QoS, retain, wildcard, shared, subscription id
 	CONNECTION_REFUSED,     // CONNACK with non-zero code; see Event
 	KEEPALIVE_TIMEOUT,
+	TOPIC_ALIAS_INVALID,    // a Topic Alias of the server that is 0, above our maximum or not known
 	RECEIVE_MAXIMUM_EXCEEDED, // the server sent more unfinished QoS 2 messages than our Receive Maximum
 	PAYLOAD_FORMAT_INVALID, // payload marked as UTF-8 text is not (checked only when asked for)
 	CLOSED,                 // transport: peer closed (EOF); same name in every plant library

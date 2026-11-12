@@ -202,14 +202,14 @@ fn void inbound_qos2_duplicate_is_delivered_once() @test
 	s.close();
 }
 
-fn void inbound_publish_with_alias_is_refused() @test
+fn void inbound_publish_with_alias_is_refused_when_none_are_accepted() @test
 {
 	Session s;
 	Config c = cfg(Version.V5);
 	s.open(&c, CONNACK_5);
-	char[] frame = testutil::hex("32 09 00 00 00 01 03 23 00 01 78");     // empty topic, Topic Alias 1: none was agreed
-	assert(@catch(s.core.input(s.clock.now, frame)) == mqtt::PROTOCOL_ERROR);
-	harness::expect_out(&s.core, "E0 01 82");
+	char[] frame = testutil::hex("32 09 00 00 00 01 03 23 00 01 78");     // empty topic, Topic Alias 1: we accept none
+	assert(@catch(s.core.input(s.clock.now, frame)) == mqtt::TOPIC_ALIAS_INVALID);
+	harness::expect_out(&s.core, "E0 01 94");
 	s.close();
 }
 

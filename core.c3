@@ -221,6 +221,7 @@ struct Core
 	List{ushort} in_qos2;           // inbound QoS 2 ids between PUBLISH and PUBREL
 	List{AliasEntry} alias_in;      // server -> topic, owned copies
 	List{AliasEntry} alias_out;     // topic -> alias, owned copies
+	List{char} topics;              // topics of events that were resolved from an alias, until the events are taken
 	ushort next_id;
 	Duration last_now;              // latest time seen, for the "never goes back" rule
 	Duration last_tx;               // when a packet was last queued
@@ -250,6 +251,8 @@ struct Inflight
 	Duration queued_at;             // for Message Expiry Interval
 	uint expiry_s;                  // 0 = none
 	bool needs_resend;              // kept from an earlier connection, not sent again yet
+	ushort alias_no;                   // Topic Alias the application asked for (0 = none); applied each time it is sent
+	bool auto_alias;                // the core chooses an alias when it is sent
 	char[] block;
 	usz topic_len;
 	usz payload_len;
@@ -262,6 +265,9 @@ struct AliasEntry { ushort alias_id; String topic; Duration last_used; }
 // A queued event. The frame it came from stays in in_buf until the queue is drained.
 struct EventRec
 {
+	bool has_topic;                 // MESSAGE: the topic was resolved from an alias and is in `topics`
+	usz topic_off;
+	usz topic_len;
 	EventKind kind;
 	usz frame_off;
 	usz frame_len;                  // 0 = no frame
@@ -336,6 +342,7 @@ fn void? Core.init(&self, Allocator allocator, Config* config)
 	self.in_qos2.init(allocator, 0);
 	self.alias_in.init(allocator, 0);
 	self.alias_out.init(allocator, 0);
+	self.topics.init(allocator, 0);
 }
 
 // Frees all owned memory. Held session state (inflight, queue) is lost.
@@ -350,8 +357,10 @@ fn void Core.free(&self)
 	self.queue.free();
 	self.pending.free();
 	self.in_qos2.free();
+	self.reset_aliases();
 	self.alias_in.free();
 	self.alias_out.free();
+	self.topics.free();
 	if (self.assigned_id.len > 0) self.assigned_id.free(self.allocator);
 	self.assigned_id = "";
 	self.state = State.DISCONNECTED;
@@ -466,6 +475,7 @@ fn void? Core.connect(&self, Duration now)
 	self.clear_pending();
 	self.apply_session_rules(t);
 	self.flow_stalled = false;
+	self.reset_aliases();
 	self.closed_seen = false;
 	self.reached_connected = false;
 	self.ping_outstanding = false;
@@ -569,6 +579,7 @@ fn void? Core.input(&self, Duration now, char[] data)
 		self.in_buf.size = left;
 		self.in_consumed = 0;
 	}
+	if (self.pending_events() == 0) self.topics.clear();                  // the topics of delivered events are not needed any more
 	if ((usz)self.in_buf.len() + data.len > self.config.effective_max_in_buffer()) return mqtt::QUEUE_FULL~;
 	self.last_rx = t;
 	self.in_buf.push_all(data);
@@ -588,7 +599,12 @@ fn void? Core.handle_frame(&self, Duration now, usz off, usz n)
 {
 	char[] frame = self.in_buf.entries[off:n];
 	Packet? decoded = packet::decode(self.config.version, frame);
-	if (catch err = decoded) return self.fail(now, err);
+	if (catch err = decoded)
+	{
+		// Topic Alias 0 is its own violation (DISCONNECT 0x94), the codec reports it as an invalid property
+		if (err == mqtt::INVALID_PROPERTY && alias_is_zero(frame)) return self.fail(now, mqtt::TOPIC_ALIAS_INVALID);
+		return self.fail(now, err);
+	}
 	Packet* p = &decoded;
 	// the first packet from the server must be CONNACK
 	if (self.state == State.CONNECTING && p.type != PacketType.CONNACK) return self.fail(now, mqtt::PROTOCOL_ERROR);
@@ -634,8 +650,8 @@ fn void? Core.handle_publish(&self, Duration now, usz off, usz n, Packet* p)
 {
 	Publish* u = &p.publish;
 	if (self.state != State.CONNECTED) return;
-	// topic aliases are not negotiated: a PUBLISH that relies on one is a protocol violation
-	if (u.topic.len == 0 || u.props.has(PropId.TOPIC_ALIAS)) return self.fail(now, mqtt::PROTOCOL_ERROR);
+	EventRec msg_rec = { .kind = EventKind.MESSAGE, .frame_off = off, .frame_len = n };
+	if (catch err = self.resolve_alias_in(u, &msg_rec)) return self.fail(now, err);
 	if (self.config.validate_payload_utf8 && u.props.has(PropId.PAYLOAD_FORMAT_INDICATOR) && u.props.payload_format == 1)
 	{
 		if (catch err = wire::validate_utf8_text((String)u.payload)) return self.fail(now, mqtt::PAYLOAD_FORMAT_INVALID);
@@ -643,9 +659,9 @@ fn void? Core.handle_publish(&self, Duration now, usz off, usz n, Packet* p)
 	switch (u.qos)
 	{
 		case QoS.AT_MOST_ONCE:
-			self.events.push({ .kind = EventKind.MESSAGE, .frame_off = off, .frame_len = n });
+			self.events.push(msg_rec);
 		case QoS.AT_LEAST_ONCE:
-			self.events.push({ .kind = EventKind.MESSAGE, .frame_off = off, .frame_len = n });
+			self.events.push(msg_rec);
 			Packet ack = { .type = PacketType.PUBACK };
 			ack.ack.packet_id = u.packet_id;
 			if (catch err = self.queue_packet(now, &ack)) return self.fail(now, err);
@@ -656,7 +672,7 @@ fn void? Core.handle_publish(&self, Duration now, usz off, usz n, Packet* p)
 				// more unfinished QoS 2 messages than the Receive Maximum we announced
 				if (is_v5(&self.config) && (usz)self.in_qos2.len() >= self.config.effective_receive_maximum()) return self.fail(now, mqtt::RECEIVE_MAXIMUM_EXCEEDED);
 				self.in_qos2.push(u.packet_id);
-				self.events.push({ .kind = EventKind.MESSAGE, .frame_off = off, .frame_len = n });
+				self.events.push(msg_rec);
 			}
 			Packet rec = { .type = PacketType.PUBREC };
 			rec.ack.packet_id = u.packet_id;
@@ -769,6 +785,7 @@ fn void Core.emit_closed(&self, Duration now, fault cause, ReasonCode reason, bo
 fn ReasonCode reason_for(fault cause) @private
 {
 	if (cause == mqtt::PACKET_TOO_LARGE) return ReasonCode.PACKET_TOO_LARGE;
+	if (cause == mqtt::TOPIC_ALIAS_INVALID) return ReasonCode.TOPIC_ALIAS_INVALID;
 	if (cause == mqtt::RECEIVE_MAXIMUM_EXCEEDED) return ReasonCode.RECEIVE_MAXIMUM_EXCEEDED;
 	if (cause == mqtt::PAYLOAD_FORMAT_INVALID) return ReasonCode.PAYLOAD_FORMAT_INVALID;
 	if (cause == mqtt::PROTOCOL_ERROR || cause == mqtt::INVALID_PROPERTY) return ReasonCode.PROTOCOL_ERROR;
@@ -849,7 +866,7 @@ fn bool Core.poll_event(&self, Event* ev)
 			Packet p = packet::decode(self.config.version, self.in_buf.entries[rec.frame_off:rec.frame_len])!!;
 			Publish* u = &p.publish;
 			ev.message = {
-				.topic = u.topic,
+				.topic = rec.has_topic ? (String)self.topics.entries[rec.topic_off:rec.topic_len] : u.topic,
 				.payload = u.payload,
 				.qos = u.qos,
 				.retain = u.retain,
@@ -1038,14 +1055,23 @@ fn ushort? Core.publish(&self, Duration now, OutMessage* msg)
 	topic::validate_name(msg.topic)!;
 	if (msg.qos.ordinal > self.limits.maximum_qos.ordinal) return mqtt::NOT_SUPPORTED_BY_SERVER~;
 	if (msg.retain && !self.limits.retain_available) return mqtt::NOT_SUPPORTED_BY_SERVER~;
-	if (msg.props.has(PropId.TOPIC_ALIAS)) return mqtt::NOT_SUPPORTED_BY_SERVER~;
+	ushort explicit;
+	if (is_v5(&self.config) && msg.props.has(PropId.TOPIC_ALIAS))
+	{
+		explicit = msg.props.topic_alias;
+		if (explicit == 0) return mqtt::INVALID_PROPERTY~;
+		if (explicit > self.limits.topic_alias_maximum) return mqtt::NOT_SUPPORTED_BY_SERVER~;     // none agreed, or above the server's maximum
+	}
 	Duration t = self.tick(now);
 	if (msg.qos != QoS.AT_MOST_ONCE) return self.publish_acknowledged(t, msg);
 	Packet p = { .type = PacketType.PUBLISH };
 	p.publish = { .qos = msg.qos, .retain = msg.retain, .topic = msg.topic, .payload = msg.payload };
 	if (is_v5(&self.config)) p.publish.props = msg.props;
+	AliasPlan plan = self.plan_alias(msg.topic, explicit, self.config.auto_topic_alias);
+	apply_alias(&p.publish, &plan);
 	self.check_outbound_size(&p)!;
 	self.queue_packet(t, &p)!;
+	self.commit_alias(t, &plan, msg.topic);
 	return 0;
 }
 
@@ -1105,6 +1131,193 @@ fn ushort? Core.unsubscribe(&self, Duration now, String[] filters, Properties* p
 	}
 	self.pending.push({ .id = id, .kind = PendingKind.UNSUBSCRIBE, .count = filters.len });
 	return id;
+}
+
+// ---- topic aliases ----
+
+// Topic Alias 0 in a PUBLISH, looked for in the raw frame (the codec refuses such a PUBLISH altogether).
+fn bool alias_is_zero(char[] frame)
+{
+	if (frame.len < 2 || frame[0] >> 4 != 3) return false;
+	ByteReader r = wire::reader(frame[1..]);
+	if (catch err = r.vbi()) return false;
+	if (catch err = r.string()) return false;
+	if ((frame[0] >> 1) & 3 != 0)
+	{
+		if (catch err = r.u16()) return false;
+	}
+	uint? len = r.vbi();
+	if (catch err = len) return false;
+	char[]? block = r.take(len);
+	if (catch err = block) return false;
+	ByteReader b = wire::reader(block);
+	while (b.remaining() > 0)
+	{
+		char? id = b.u8();
+		if (catch err = id) return false;
+		if (id == 0x23)
+		{
+			ushort? v = b.u16();
+			if (catch err = v) return false;
+			return v == 0;
+		}
+		if (catch err = props::skip_value(&b, id)) return false;
+	}
+	return false;
+}
+
+fn void Core.reset_aliases(&self)
+{
+	foreach (e : self.alias_in) e.topic.free(self.allocator);
+	self.alias_in.clear();
+	foreach (e : self.alias_out) e.topic.free(self.allocator);
+	self.alias_out.clear();
+}
+
+// An inbound PUBLISH with a Topic Alias [5.0 3.3.2.3.4]: a topic together with an alias binds it; an alias alone
+// stands for the topic it was bound to. The table keeps its own copies; the topic of a message that used
+// only the alias is copied into `topics`, so a later rebinding cannot change a message nobody has taken yet.
+fn void? Core.resolve_alias_in(&self, Publish* u, EventRec* rec)
+{
+	if (!is_v5(&self.config)) return;
+	if (!u.props.has(PropId.TOPIC_ALIAS))
+	{
+		if (u.topic.len == 0) return mqtt::PROTOCOL_ERROR~;          // no topic and no alias
+		return;
+	}
+	ushort alias_no = u.props.topic_alias;
+	if (alias_no == 0 || alias_no > self.config.topic_alias_maximum) return mqtt::TOPIC_ALIAS_INVALID~;
+	sz at = -1;
+	for (sz i = 0; i < self.alias_in.len(); i++)
+	{
+		if (self.alias_in.entries[i].alias_id == alias_no) at = i;
+	}
+	if (u.topic.len > 0)
+	{
+		String copy = u.topic.copy(self.allocator);
+		if (at >= 0)
+		{
+			self.alias_in.entries[at].topic.free(self.allocator);
+			self.alias_in.entries[at].topic = copy;
+		}
+		else
+		{
+			self.alias_in.push({ .alias_id = alias_no, .topic = copy });
+		}
+		return;
+	}
+	if (at < 0) return mqtt::TOPIC_ALIAS_INVALID~;                   // an alias that was never bound on this connection
+	String bound = self.alias_in.entries[at].topic;
+	rec.has_topic = true;
+	rec.topic_off = (usz)self.topics.len();
+	rec.topic_len = bound.len;
+	self.topics.push_all((char[])bound);
+}
+
+// What to send for the topic of an outbound PUBLISH: nothing special, the topic and an alias that binds it,
+// or only the alias (the server already has the binding).
+struct AliasPlan
+{
+	ushort alias_no;                   // 0 = no alias
+	bool short_form;                // the topic is left out
+	bool new_binding;               // the table must be updated when the packet is queued
+	sz replaces;                    // index of the entry that is overwritten, -1 = a new entry
+}
+
+fn sz Core.find_alias_out(&self, ushort alias_no)
+{
+	for (sz i = 0; i < self.alias_out.len(); i++)
+	{
+		if (self.alias_out.entries[i].alias_id == alias_no) return i;
+	}
+	return -1;
+}
+
+// Decides about the alias without changing anything. `explicit` is the alias the application asked for (0 = none);
+// with auto_topic_alias the core assigns one, the least recently used when the server's maximum is reached.
+fn AliasPlan Core.plan_alias(&self, String topic, ushort explicit, bool auto)
+{
+	AliasPlan plan = { .replaces = -1 };
+	if (!is_v5(&self.config) || self.limits.topic_alias_maximum == 0) return plan;
+	if (explicit > self.limits.topic_alias_maximum) explicit = 0;      // a server that takes fewer aliases than before
+	if (explicit != 0)
+	{
+		plan.alias_no = explicit;
+		sz at = self.find_alias_out(explicit);
+		if (at >= 0 && self.alias_out.entries[at].topic == topic)
+		{
+			plan.short_form = true;
+		}
+		else
+		{
+			plan.new_binding = true;
+			plan.replaces = at;
+		}
+		return plan;
+	}
+	if (!auto) return plan;
+	for (sz i = 0; i < self.alias_out.len(); i++)
+	{
+		if (self.alias_out.entries[i].topic == topic)
+		{
+			plan.alias_no = self.alias_out.entries[i].alias_id;
+			plan.short_form = true;
+			return plan;
+		}
+	}
+	plan.new_binding = true;
+	if ((usz)self.alias_out.len() < self.limits.topic_alias_maximum)
+	{
+		// the lowest alias number that is not bound
+		for (ushort a = 1; a <= self.limits.topic_alias_maximum; a++)
+		{
+			if (self.find_alias_out(a) < 0)
+			{
+				plan.alias_no = a;
+				return plan;
+			}
+		}
+	}
+	sz lru = 0;
+	for (sz i = 1; i < self.alias_out.len(); i++)
+	{
+		if (self.alias_out.entries[i].last_used < self.alias_out.entries[lru].last_used) lru = i;
+	}
+	plan.alias_no = self.alias_out.entries[lru].alias_id;
+	plan.replaces = lru;
+	return plan;
+}
+
+// Puts the plan into a PUBLISH that is about to be queued (the topic goes away in the short form).
+fn void apply_alias(Publish* u, AliasPlan* plan)
+{
+	if (plan.alias_no == 0) return;
+	u.props.set(PropId.TOPIC_ALIAS);
+	u.props.topic_alias = plan.alias_no;
+	if (plan.short_form) u.topic = "";
+}
+
+// The packet was queued: the server knows the binding now.
+fn void Core.commit_alias(&self, Duration now, AliasPlan* plan, String topic)
+{
+	if (plan.alias_no == 0) return;
+	if (plan.new_binding)
+	{
+		String copy = topic.copy(self.allocator);
+		if (plan.replaces >= 0)
+		{
+			self.alias_out.entries[plan.replaces].topic.free(self.allocator);
+			self.alias_out.entries[plan.replaces].topic = copy;
+			self.alias_out.entries[plan.replaces].last_used = now;
+		}
+		else
+		{
+			self.alias_out.push({ .alias_id = plan.alias_no, .topic = copy, .last_used = now });
+		}
+		return;
+	}
+	sz at = self.find_alias_out(plan.alias_no);
+	if (at >= 0) self.alias_out.entries[at].last_used = now;
 }
 
 // ---- session state across connections ----
@@ -1205,7 +1418,8 @@ fn void? Core.resend_pending(&self, Duration now)
 		{
 			ReasonCode refused = ReasonCode.SUCCESS;
 			Packet p;
-			self.fill_publish(now, r, true, &p)!;
+			AliasPlan plan = { .replaces = -1 };
+			self.fill_publish(now, r, true, &p, &plan)!;
 			if (r.qos.ordinal > self.limits.maximum_qos.ordinal)
 			{
 				refused = ReasonCode.QOS_NOT_SUPPORTED;
@@ -1231,6 +1445,7 @@ fn void? Core.resend_pending(&self, Duration now)
 				break;
 			}
 			self.queue_packet(now, &p)!;
+			self.commit_alias(now, &plan, (String)r.block[:r.topic_len]);
 		}
 		r.needs_resend = false;
 		active++;
@@ -1257,12 +1472,16 @@ fn sz Core.find_inflight(&self, ushort id)
 }
 
 // Copies topic, payload and (5.0) properties of a message into one block that lives until the flow ends.
-fn Inflight? Core.make_record(&self, Duration now, OutMessage* msg)
+fn Inflight? Core.make_record(&self, Duration now, OutMessage* msg, ushort explicit_alias)
 {
 	bool v5 = is_v5(&self.config);
 	usz tl = msg.topic.len;
 	usz pl = msg.payload.len;
-	usz props_len = v5 ? props::properties_size(&msg.props, PropContext.PUBLISH)! : 0;
+	// the alias is not part of the stored properties: it is applied each time the message is sent
+	Properties stored = msg.props;
+	stored.present &= ~(1UL << (uint)(char)PropId.TOPIC_ALIAS);
+	stored.topic_alias = 0;
+	usz props_len = v5 ? props::properties_size(&stored, PropContext.PUBLISH)! : 0;
 	char[] block = alloc::alloc_array(self.allocator, char, (sz)(tl + pl + props_len));
 	block[:tl] = ((char[])msg.topic)[..];
 	if (pl > 0) block[tl:pl] = msg.payload[..];
@@ -1277,12 +1496,14 @@ fn Inflight? Core.make_record(&self, Duration now, OutMessage* msg)
 	if (v5)
 	{
 		ByteWriter w = wire::writer(block[tl + pl..]);
-		if (catch err = w.properties(&msg.props, PropContext.PUBLISH))
+		if (catch err = w.properties(&stored, PropContext.PUBLISH))
 		{
 			self.free_block(&r);
 			return err~;
 		}
 		if (msg.props.has(PropId.MESSAGE_EXPIRY_INTERVAL)) r.expiry_s = msg.props.message_expiry;
+		r.alias_no = explicit_alias;
+		r.auto_alias = explicit_alias == 0 && self.config.auto_topic_alias;
 	}
 	return r;
 }
@@ -1299,7 +1520,7 @@ fn uint Core.remaining_expiry(&self, Duration now, Inflight* r)
 
 // The PUBLISH packet of a record (borrowing from its block): the Message Expiry Interval, if there is
 // one, becomes the time left.
-fn void? Core.fill_publish(&self, Duration now, Inflight* r, bool dup, Packet* p)
+fn void? Core.fill_publish(&self, Duration now, Inflight* r, bool dup, Packet* p, AliasPlan* plan)
 {
 	*p = { .type = PacketType.PUBLISH };
 	Publish* u = &p.publish;
@@ -1314,6 +1535,8 @@ fn void? Core.fill_publish(&self, Duration now, Inflight* r, bool dup, Packet* p
 		ByteReader rd = wire::reader(r.block[r.topic_len + r.payload_len..]);
 		u.props = rd.properties(PropContext.PUBLISH)!;
 		if (r.expiry_s != 0) u.props.message_expiry = self.remaining_expiry(now, r);
+		*plan = self.plan_alias(u.topic, r.alias_no, r.auto_alias);
+		apply_alias(u, plan);
 	}
 }
 
@@ -1321,19 +1544,23 @@ fn void? Core.fill_publish(&self, Duration now, Inflight* r, bool dup, Packet* p
 fn void? Core.send_record(&self, Duration now, Inflight* r, bool dup)
 {
 	Packet p;
-	self.fill_publish(now, r, dup, &p)!;
+	AliasPlan plan = { .replaces = -1 };
+	self.fill_publish(now, r, dup, &p, &plan)!;
 	self.queue_packet(now, &p)!;
+	self.commit_alias(now, &plan, (String)r.block[:r.topic_len]);
 }
 
 // QoS 1 and 2 publish: sent at once if the server's window has room, else queued (FIFO).
 fn ushort? Core.publish_acknowledged(&self, Duration now, OutMessage* msg)
 {
+	ushort explicit;
+	if (is_v5(&self.config) && msg.props.has(PropId.TOPIC_ALIAS)) explicit = msg.props.topic_alias;
 	Packet probe = { .type = PacketType.PUBLISH };
 	probe.publish = { .qos = msg.qos, .topic = msg.topic, .payload = msg.payload, .packet_id = 1 };
 	if (is_v5(&self.config)) probe.publish.props = msg.props;
 	packet::encoded_size(self.config.version, &probe)!;           // refuses what could never be sent
 	self.check_outbound_size(&probe)!;
-	Inflight r = self.make_record(now, msg)!;
+	Inflight r = self.make_record(now, msg, explicit)!;
 	if (self.queue.len() > 0 || self.inflight.len() >= (sz)self.limits.send_quota)
 	{
 		if ((usz)self.queue.len() >= self.config.effective_max_queued())
@@ -1379,7 +1606,8 @@ fn void? Core.drain_queue(&self, Duration now)
 		// is there room for it in the output buffer? (the size does not depend on the id)
 		r.id = 1;
 		Packet p;
-		self.fill_publish(now, &r, false, &p)!;
+		AliasPlan plan = { .replaces = -1 };
+		self.fill_publish(now, &r, false, &p, &plan)!;
 		if (!self.has_room(packet::encoded_size(self.config.version, &p)!))
 		{
 			self.flow_stalled = true;                      // back pressure: it stays queued
@@ -1395,6 +1623,7 @@ fn void? Core.drain_queue(&self, Duration now)
 			self.release_id(id);
 			return err~;
 		}
+		self.commit_alias(now, &plan, (String)r.block[:r.topic_len]);
 		self.queue.remove_first()!!;
 		self.inflight.push(r);
 	}

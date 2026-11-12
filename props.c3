@@ -234,7 +234,8 @@ fn bool nonzero_ok(char id, uint v) @private
 // ---- decode ----
 
 // Skips one value of the property `id` (used when walking a block for one kind of property).
-fn void? skip_value(ByteReader* r, char id) @private
+// Skips one value of the property `id` (its identifier was read already).
+fn void? skip_value(ByteReader* r, char id)
 {
 	switch (kind_of(id))
 	{
