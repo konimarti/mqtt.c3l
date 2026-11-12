@@ -29,8 +29,9 @@ fn int run()
 	char[1] codes;
 	c.subscribe(entries[..], codes[..], time::sec(5))!!;
 	Event ev;
-	while (c.next(&ev, time::sec(30))!!)
+	while (true)
 	{
+		if (!c.next(&ev, time::sec(30))!!) continue;           // nothing for 30 s: still connected, ask again
 		if (ev.kind == EventKind.CLOSED) break;
 		if (ev.kind == EventKind.MESSAGE) io::printfn("%s: %s", ev.message.topic, (String)ev.message.payload);
 	}
@@ -81,8 +82,22 @@ build/mqttc pub -h localhost -t plant/line1/temp -m 21.5 -q 1
 build/mqttc sub -h localhost -t 'plant/#' -q 1 -c 10
 ```
 
-`--v311` selects MQTT 3.1.1 (5.0 is the default), `--follow-redirect` follows a server redirect (at most 3 hops), `-v` reports
-progress on stderr. The client id is `mqttc-<random>` unless `-i` is given. The password is read from `--password-file FILE`
-or the environment variable `MQTT_PASSWORD`; `-P` works but warns, because the command line is visible to other users. It is
-never printed. A retained message with an empty payload deletes the retained message and is refused unless
-`--allow-clear-retained` is given. `build/mqttc` without arguments prints the usage.
+- `--v311` selects MQTT 3.1.1 (5.0 is the default). The client id is `mqttc-<random>` (from the system generator) unless `-i` is given.
+- `pub` sends the text of `-m`, or the content of a file with `-f FILE` (binary data is fine). `sub` prints one line per message, topic,
+  a tab, the payload; control characters in them are written as `\xNN` and a backslash as `\\`. It runs until `-c COUNT` messages
+  came (counted over redirects too); without `-c` it never ends, and an interrupt (Ctrl-C) closes the connection without
+  DISCONNECT, so the broker publishes the will.
+- Credentials: `-u USER` with the password from `--password-file FILE` (one trailing line end is removed; a warning is printed when
+  others can read the file) or the environment variable `MQTT_PASSWORD`. Both are used only together with `-u`; an empty password
+  is refused. `-P` works but warns, because the command line is visible to other users. The password is never printed.
+- A retained message with an empty payload (also an empty file) deletes the retained message and is refused unless
+  `--allow-clear-retained` is given.
+- `--follow-redirect` follows a server redirect, at most 3 hops, from a refused CONNECT and, in `sub`, from a DISCONNECT of the
+  server. User name, password and will go only to the host that was asked for (compared without regard to case); to another host
+  the connection is made without them, unless `--redirect-credentials` is given. A server DISCONNECT with a reference after a `pub`
+  has finished is not followed.
+- Limits: 5 s to connect, 10 s for every wait. Flags given twice: the last one counts; values are taken as they are, also when they start
+  with `-`.
+- Exit codes: 0 done, 1 a runtime error (connection, refusal, timeout), 2 a command line error. `-v` reports progress on stderr.
+  `build/mqttc` without arguments prints the usage.
+

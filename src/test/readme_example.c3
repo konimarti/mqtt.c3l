@@ -19,8 +19,9 @@ fn int run() @private
 	char[1] codes;
 	c.subscribe(entries[..], codes[..], time::sec(5))!!;
 	Event ev;
-	while (c.next(&ev, time::sec(30))!!)
+	while (true)
 	{
+		if (!c.next(&ev, time::sec(30))!!) continue;           // nothing for 30 s: still connected, ask again
 		if (ev.kind == EventKind.CLOSED) break;
 		if (ev.kind == EventKind.MESSAGE) io::printfn("%s: %s", ev.message.topic, (String)ev.message.payload);
 	}
