@@ -163,9 +163,11 @@ build/mqttc sub -h localhost -t 'plant/#' -q 1 -c 10
 ## Running the peer tests
 
 `build/itest` runs scenarios against a live broker and prints `PASS name`, `FAIL name reason` or `SKIP name reason` (the exit code is the
-number of failures; a scenario the broker cannot do is a SKIP with the reason, never silent). `tools/peer.py` (Python 3, standard
+number of failures; a scenario the broker cannot do is a SKIP with the reason, never silent; without a reachable broker there is one SKIP line and exit code 0). `tools/peer.py` (Python 3, standard
 library only) starts a broker for each group of scenarios (`basic`, `limits`, `sessions`) with the limits that group needs, runs
-`itest` and stops the broker, also on Ctrl-C and on a timeout:
+`itest` and stops the broker, also on Ctrl-C, on SIGTERM and on a timeout. The group `restart` stops the broker and starts it again between
+two parts of one scenario (a QoS 2 message kept for an absent client must survive). A broker that is not installed gives
+`SKIP <kind> broker not available: ...` and exit code 0:
 
 ```sh
 c3c build itest
@@ -175,7 +177,8 @@ python3 tools/peer.py --kind paho --version 5 --group limits
 
 The broker command comes from the kind, or from `MQTT_PEER_CMD` (a command line with `{config}` and `{port}`); `MQTT_PEER_PORT` fixes the
 port. `itest` itself reads `MQTT_PEER=host:port` and `MQTT_PEER_KIND`, so it can be pointed at any broker by hand.
-The `paho` kind needs the Eclipse Paho interoperability test broker (Python) checked out in `.work/peer/paho`; nothing is installed.
+The `paho` kind needs the Eclipse Paho interoperability test broker (Python, `github.com/eclipse/paho.mqtt.testing`; CI uses the commit named in
+`ci.yml`) checked out in `.work/peer/paho` (git-ignored), or any broker through `MQTT_PEER_CMD`; the `mosquitto` kind needs `mosquitto` on the PATH.
 The unit tests (`c3c test`) need no broker.
 
 ### Interop notes
@@ -186,8 +189,8 @@ library:
 - Receive Maximum, Maximum Packet Size and Topic Alias Maximum from the configuration are announced in the CONNACK and kept by the
   broker; the library never has more than Receive Maximum messages unacknowledged and refuses a larger packet locally.
 - The broker ignores the settings for Maximum QoS and Retain Available and does not announce them. The scenarios that need them are skipped.
-- It has no user name and password support (the authentication scenario is skipped) and keeps no sessions over a restart, so the
-  "broker killed in the middle of a QoS 2 flow" scenario is skipped. Sessions that the broker keeps while it runs (offline queue, takeover with
+- It accepts any user name and password (the authentication scenario tries a wrong password and skips when it is let in) and keeps
+  no sessions over a restart (the restart scenario finds the QoS 2 message gone and skips). Sessions that the broker keeps while it runs (offline queue, takeover with
   reason 0x8E, expiry interval, shared subscriptions, No Local, Retain As Published, Retain Handling 0/1/2) behave as the specification says.
 - A `$share/g/t` filter on a 3.1.1 connection is an ordinary filter to the broker: it is granted (QoS 1) and nothing published to
   `t` reaches it, which is what the library assumes.
