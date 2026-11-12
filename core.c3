@@ -227,7 +227,9 @@ struct Core
 	Duration last_rx;               // when bytes last arrived
 	Duration ping_sent;
 	bool ping_outstanding;
-	Duration closed_at;
+	Duration closed_at;             // when the last connection that reached CONNECTED ended
+	bool offline_valid;             // closed_at / closed_expiry are set
+	uint closed_expiry;             // the session expiry (seconds) that connection ended with
 	bool closed_seen;               // CLOSED was emitted for the current connection
 	bool reached_connected;         // the current connection got a CONNACK that accepted it
 	Limits limits;                  // negotiated by CONNACK
@@ -246,6 +248,7 @@ struct Inflight
 	bool retain;
 	Duration queued_at;             // for Message Expiry Interval
 	uint expiry_s;                  // 0 = none
+	bool needs_resend;              // kept from an earlier connection, not sent again yet
 	char[] block;
 	usz topic_len;
 	usz payload_len;
@@ -413,6 +416,7 @@ fn void? Core.connect(&self, Duration now)
 	self.out_buf.clear();
 	self.in_buf.size = self.in_consumed;             // bytes of an earlier connection are void
 	self.clear_pending();
+	self.apply_session_rules(t);
 	self.closed_seen = false;
 	self.reached_connected = false;
 	self.ping_outstanding = false;
@@ -667,6 +671,7 @@ fn void? Core.handle_connack(&self, Duration now, usz off, usz n, Packet* p)
 	self.reached_connected = true;
 	self.ping_outstanding = false;
 	self.events.push({ .kind = EventKind.CONNECTED, .frame_off = off, .frame_len = n });
+	if (catch err = self.resume_session(now, a.session_present)) return self.fail(now, err);
 }
 
 // The connection ended with `cause`: queue CLOSED (once per connection) and stop.
@@ -676,7 +681,12 @@ fn void Core.emit_closed(&self, Duration now, fault cause, ReasonCode reason, bo
 	self.clear_pending();                          // a SUBSCRIBE or UNSUBSCRIBE is not repeated on a new connection
 	if (self.closed_seen) return;
 	self.closed_seen = true;
-	if (self.reached_connected) self.closed_at = now;
+	if (self.reached_connected)
+	{
+		self.closed_at = now;
+		self.closed_expiry = self.limits.session_expiry;
+		self.offline_valid = true;
+	}
 	bool kept = is_v5(&self.config) ? self.limits.session_expiry != 0 || (!self.reached_connected && self.config.session_expiry != 0) : !self.config.clean_start;
 	self.events.push({
 		.kind = EventKind.CLOSED,
@@ -875,12 +885,24 @@ fn void? Core.disconnect(&self, Duration now, ReasonCode reason, Properties* pro
 	if (self.state != State.CONNECTING && self.state != State.CONNECTED) return mqtt::NOT_CONNECTED~;
 	Duration t = self.tick(now);
 	Packet d = { .type = PacketType.DISCONNECT };
+	bool new_expiry;
 	if (is_v5(&self.config))
 	{
 		d.disconnect.reason = (char)reason;
-		if (props != null) d.disconnect.props = *props;
+		if (props != null)
+		{
+			d.disconnect.props = *props;
+			if (props.has(PropId.SESSION_EXPIRY_INTERVAL))
+			{
+				// [5.0 3.14.2.2.2]: a session that ends with the connection cannot be kept alive by DISCONNECT
+				uint now_expiry = self.reached_connected ? self.limits.session_expiry : self.config.session_expiry;
+				if (now_expiry == 0 && props.session_expiry != 0) return mqtt::INVALID_ARGUMENT~;
+				new_expiry = true;
+			}
+		}
 	}
 	self.queue_packet(t, &d)!;
+	if (new_expiry && self.reached_connected) self.limits.session_expiry = props.session_expiry;
 	self.state = State.DISCONNECTING;
 }
 
@@ -1018,6 +1040,127 @@ fn ushort? Core.unsubscribe(&self, Duration now, String[] filters, Properties* p
 	return id;
 }
 
+// ---- session state across connections ----
+
+// The flow of a record ends without the server's answer: free it and report PUBLISH_DONE.
+fn void Core.drop_record(&self, Inflight* r, ReasonCode reason)
+{
+	self.release_id(r.id);
+	self.free_block(r);
+	self.events.push({ .kind = EventKind.PUBLISH_DONE, .reason = reason, .packet_id = r.id });
+}
+
+// Forgets all session state without telling the application (a clean start asked for it).
+fn void Core.discard_session(&self)
+{
+	foreach (r : self.inflight)
+	{
+		self.release_id(r.id);
+		self.free_block(&r);
+	}
+	self.inflight.clear();
+	foreach (r : self.queue) self.free_block(&r);
+	self.queue.clear();
+	self.in_qos2.clear();
+}
+
+// Messages that were sent but not finished are lost; each is reported with PUBLISH_DONE.
+fn void Core.lose_inflight(&self)
+{
+	foreach (r : self.inflight) self.drop_record(&r, ReasonCode.UNSPECIFIED_ERROR);
+	self.inflight.clear();
+	self.in_qos2.clear();
+}
+
+// At connect: a clean start drops everything; with 5.0 a session that outlived its expiry interval
+// while we were offline is gone on the server too, so what we hold for it is lost.
+fn void Core.apply_session_rules(&self, Duration now)
+{
+	if (self.config.clean_start)
+	{
+		self.discard_session();
+		return;
+	}
+	if (!is_v5(&self.config) || !self.offline_valid) return;
+	if (self.closed_expiry == 0xFFFFFFFF) return;                       // never expires
+	long offline = (now - self.closed_at).to_ms();
+	if (offline >= (long)self.closed_expiry * 1000) self.lose_inflight();
+}
+
+// CONNACK accepted: with a stored session on the server the unfinished messages go out again, DUP set,
+// in their original order and paced by the new window; without one they are lost.
+fn void? Core.resume_session(&self, Duration now, bool session_present)
+{
+	if (session_present)
+	{
+		for (sz i = 0; i < self.inflight.len(); i++) self.inflight.entries[i].needs_resend = true;
+	}
+	else
+	{
+		self.lose_inflight();
+	}
+	self.resend_pending(now)!;
+	self.drain_queue(now)!;
+}
+
+// Sends records of an earlier connection again while the window of this one has room. A record the
+// server could not take now (QoS above its maximum, packet over its size limit, interval used up) is
+// failed. PUBREL records are exempt from payload limits but occupy the window.
+fn void? Core.resend_pending(&self, Duration now)
+{
+	sz active;
+	for (sz i = 0; i < self.inflight.len(); i++)
+	{
+		if (!self.inflight.entries[i].needs_resend) active++;
+	}
+	sz i;
+	while (i < self.inflight.len())
+	{
+		Inflight* r = &self.inflight.entries[i];
+		if (!r.needs_resend)
+		{
+			i++;
+			continue;
+		}
+		if (active >= (sz)self.limits.send_quota) break;
+		if (r.state == InflightState.WAIT_PUBCOMP)
+		{
+			Packet rel = { .type = PacketType.PUBREL };
+			rel.ack.packet_id = r.id;
+			self.queue_packet(now, &rel)!;
+		}
+		else
+		{
+			ReasonCode refused = ReasonCode.SUCCESS;
+			Packet p;
+			self.fill_publish(now, r, true, &p)!;
+			if (r.qos.ordinal > self.limits.maximum_qos.ordinal)
+			{
+				refused = ReasonCode.QOS_NOT_SUPPORTED;
+			}
+			else if (r.expiry_s != 0 && self.remaining_expiry(now, r) == 0)
+			{
+				refused = ReasonCode.UNSPECIFIED_ERROR;
+			}
+			else if (self.limits.max_packet_size != 0 && packet::encoded_size(self.config.version, &p)! > self.limits.max_packet_size)
+			{
+				refused = ReasonCode.PACKET_TOO_LARGE;
+			}
+			if (refused != ReasonCode.SUCCESS)
+			{
+				Inflight dead = *r;
+				self.inflight.remove_at(i);
+				self.drop_record(&dead, refused);
+				continue;
+			}
+			self.queue_packet(now, &p)!;
+		}
+		r.needs_resend = false;
+		active++;
+		i++;
+	}
+}
+
 // ---- QoS 1 and 2: messages we send ----
 
 fn void Core.free_block(&self, Inflight* r)
@@ -1077,10 +1220,11 @@ fn uint Core.remaining_expiry(&self, Duration now, Inflight* r)
 	return (uint)((total - elapsed + 999) / 1000);
 }
 
-// (Re)sends the PUBLISH of a record: the Message Expiry Interval, if there is one, becomes the time left.
-fn void? Core.send_record(&self, Duration now, Inflight* r, bool dup)
+// The PUBLISH packet of a record (borrowing from its block): the Message Expiry Interval, if there is
+// one, becomes the time left.
+fn void? Core.fill_publish(&self, Duration now, Inflight* r, bool dup, Packet* p)
 {
-	Packet p = { .type = PacketType.PUBLISH };
+	*p = { .type = PacketType.PUBLISH };
 	Publish* u = &p.publish;
 	u.qos = r.qos;
 	u.retain = r.retain;
@@ -1094,6 +1238,13 @@ fn void? Core.send_record(&self, Duration now, Inflight* r, bool dup)
 		u.props = rd.properties(PropContext.PUBLISH)!;
 		if (r.expiry_s != 0) u.props.message_expiry = self.remaining_expiry(now, r);
 	}
+}
+
+// (Re)sends the PUBLISH of a record.
+fn void? Core.send_record(&self, Duration now, Inflight* r, bool dup)
+{
+	Packet p;
+	self.fill_publish(now, r, dup, &p)!;
 	self.queue_packet(now, &p)!;
 }
 
@@ -1170,6 +1321,7 @@ fn void? Core.finish_record(&self, Duration now, sz idx, ReasonCode reason, usz 
 	self.free_block(&r);
 	self.release_id(r.id);
 	self.events.push({ .kind = EventKind.PUBLISH_DONE, .reason = reason, .packet_id = r.id, .frame_off = off, .frame_len = n });
+	if (catch err = self.resend_pending(now)) return self.fail(now, err);
 	if (catch err = self.drain_queue(now)) return self.fail(now, err);
 }
 
@@ -1218,6 +1370,7 @@ fn void? Core.handle_ack(&self, Duration now, usz off, usz n, Packet* p)
 					else
 					{
 						r.state = InflightState.WAIT_PUBCOMP;
+						r.needs_resend = false;
 						self.send_pubrel(now, a.packet_id, 0)!;
 					}
 				case InflightState.WAIT_PUBCOMP:
