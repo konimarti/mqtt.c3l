@@ -613,11 +613,9 @@ fn usz? encoded_size(Version v, Packet* p)
 
 // 5.0 acknowledgements, DISCONNECT and AUTH: how much of "reason code, properties" is needed.
 // 0 = nothing, 1 = reason code, 2 = reason code and properties.
-fn int short_form(char reason, Properties* props, PropContext ctx) @private
+fn int short_form(char reason, usz props_size) @private
 {
-	usz? size = props::properties_size(props, ctx);
-	if (catch err = size) return 2;           // the caller's size computation reports the fault
-	if (size > 1) return 2;
+	if (props_size > 1) return 2;             // a property block longer than its length byte: keep it
 	return reason == 0 ? 0 : 1;
 }
 
@@ -700,7 +698,7 @@ fn usz? body_size(Version v, Packet* p) @private
 			if (!reason_allowed(p.type, k.reason)) return mqtt::INVALID_ARGUMENT~;
 			PropContext ctx = context_of(p.type);
 			usz psz = props::properties_size(&k.props, ctx)!;
-			switch (short_form(k.reason, &k.props, ctx))
+			switch (short_form(k.reason, psz))
 			{
 				case 0: return 2;
 				case 1: return 3;
@@ -771,7 +769,7 @@ fn usz? body_size(Version v, Packet* p) @private
 			Disconnect* d = &p.disconnect;
 			if (!reason_allowed(PacketType.DISCONNECT, d.reason)) return mqtt::INVALID_ARGUMENT~;
 			usz psz = props::properties_size(&d.props, PropContext.DISCONNECT)!;
-			switch (short_form(d.reason, &d.props, PropContext.DISCONNECT))
+			switch (short_form(d.reason, psz))
 			{
 				case 0: return 0;
 				case 1: return 1;
@@ -782,7 +780,7 @@ fn usz? body_size(Version v, Packet* p) @private
 			Auth* a = &p.auth;
 			if (!reason_allowed(PacketType.AUTH, a.reason)) return mqtt::INVALID_ARGUMENT~;
 			usz psz = props::properties_size(&a.props, PropContext.AUTH)!;
-			switch (short_form(a.reason, &a.props, PropContext.AUTH))
+			switch (short_form(a.reason, psz))
 			{
 				case 0: return 0;
 				case 1: return 1;
@@ -816,13 +814,13 @@ fn usz? encode(Version v, Packet* p, char[] out)
 		case PacketType.PUBLISH:
 			encode_publish(v, &w, &p.publish, rl)!;
 		case PacketType.PUBACK:
-			encode_ack(v, &w, p.type, 0x40, &p.ack)!;
+			encode_ack(v, &w, p.type, 0x40, &p.ack, rl)!;
 		case PacketType.PUBREC:
-			encode_ack(v, &w, p.type, 0x50, &p.ack)!;
+			encode_ack(v, &w, p.type, 0x50, &p.ack, rl)!;
 		case PacketType.PUBREL:
-			encode_ack(v, &w, p.type, 0x62, &p.ack)!;
+			encode_ack(v, &w, p.type, 0x62, &p.ack, rl)!;
 		case PacketType.PUBCOMP:
-			encode_ack(v, &w, p.type, 0x70, &p.ack)!;
+			encode_ack(v, &w, p.type, 0x70, &p.ack, rl)!;
 		case PacketType.SUBSCRIBE:
 			w.u8(0x82)!;
 			w.vbi((uint)rl)!;
@@ -942,7 +940,7 @@ fn void? encode_publish(Version v, ByteWriter* w, Publish* u, usz rl) @private
 }
 
 // PUBACK, PUBREC, PUBREL, PUBCOMP. 5.0: the shortest form that carries the content.
-fn void? encode_ack(Version v, ByteWriter* w, PacketType t, char first, Ack* a) @private
+fn void? encode_ack(Version v, ByteWriter* w, PacketType t, char first, Ack* a, usz rl) @private
 {
 	w.u8(first)!;
 	if (v == Version.V311)
@@ -951,21 +949,10 @@ fn void? encode_ack(Version v, ByteWriter* w, PacketType t, char first, Ack* a) 
 		w.u16(a.packet_id)!;
 		return;
 	}
-	PropContext ctx = context_of(t);
-	switch (short_form(a.reason, &a.props, ctx))
-	{
-		case 0:
-			w.vbi(2)!;
-			w.u16(a.packet_id)!;
-		case 1:
-			w.vbi(3)!;
-			w.u16(a.packet_id)!;
-			w.u8(a.reason)!;
-		default:
-			usz psz = props::properties_size(&a.props, ctx)!;
-			w.vbi((uint)(3 + psz))!;
-			w.u16(a.packet_id)!;
-			w.u8(a.reason)!;
-			w.properties(&a.props, ctx)!;
-	}
+	// rl was computed when the packet was sized: 2 = id only, 3 = id and reason, more = with properties
+	w.vbi((uint)rl)!;
+	w.u16(a.packet_id)!;
+	if (rl == 2) return;
+	w.u8(a.reason)!;
+	if (rl > 3) w.properties(&a.props, context_of(t))!;
 }
