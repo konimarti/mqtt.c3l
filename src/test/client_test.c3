@@ -1,5 +1,5 @@
 module mqtt::client_test;
-import mqtt, mqtt::client, mqtt::core, mqtt::testutil, mqtt::transport, std::net, std::net::tcp, std::time;
+import mqtt, mqtt::client, mqtt::core, mqtt::testutil, mqtt::transport, std::core::mem::allocators, std::net, std::net::tcp, std::time;
 
 // A transport in memory: what the "server" will send is in `incoming`, what the client wrote is collected
 // in `written`. Rules make it answer writes (a CONNACK after the CONNECT, a PUBACK after a PUBLISH). It
@@ -26,7 +26,9 @@ struct Script
 	bool eof;
 	bool stall_writes;
 	bool closed;
+	usz max_chunk;                  // read at most this many bytes at a time (0 = no limit)
 	Duration now;
+	TrackingAllocator mem_track;
 }
 
 fn void Script.add(&self, String hex)
@@ -47,6 +49,7 @@ fn usz? Script.read(&self, char[] buf, Duration timeout) @dynamic
 	{
 		usz n = self.in_len - self.pos;
 		if (n > buf.len) n = buf.len;
+		if (self.max_chunk != 0 && n > self.max_chunk) n = self.max_chunk;
 		buf[:n] = self.incoming[self.pos:n];
 		self.pos += n;
 		return n;
@@ -105,8 +108,16 @@ fn bool wrote(Script* s, String hex)
 fn void start(Client* c, Script* s, Config* config)
 {
 	s.on_write(0x10, "20 02 00 00");
+	s.mem_track.init(mem);
 	c.use_clock(&script_clock, s);
-	c.open(mem, (Transport)s, config, time::sec(5))!!;
+	c.open(&s.mem_track, (Transport)s, config, time::sec(5))!!;
+}
+
+// after c.close(): the client released everything it took
+fn void Script.leak_check(&self)
+{
+	assert(self.mem_track.allocation_count() == 0, "the client released everything");
+	self.mem_track.free();
 }
 
 fn void client_open() @test
@@ -119,6 +130,7 @@ fn void client_open() @test
 	assert(wrote(&s, "10 0D 00 04 4D 51 54 54 04 02 00 3C 00 01 61"), "the CONNECT was written");
 	assert(!s.closed);
 	c.close();
+	s.leak_check();
 }
 
 fn void client_publish_wait_qos1() @test
@@ -138,6 +150,7 @@ fn void client_publish_wait_qos1() @test
 	assert(c.publish_wait(&z, time::sec(5))!! == ReasonCode.SUCCESS);
 	assert(wrote(&s, "30 07 00 03 61 2F 62 68 69"));
 	c.close();
+	s.leak_check();
 }
 
 fn void client_subscribe() @test
@@ -156,6 +169,7 @@ fn void client_subscribe() @test
 	usz m = c.unsubscribe(filters[..], codes[..], time::sec(5))!!;
 	assert(m == 0, "a 3.1.1 UNSUBACK carries no codes");
 	c.close();
+	s.leak_check();
 }
 
 fn void client_next_message() @test
@@ -171,6 +185,7 @@ fn void client_next_message() @test
 	// nothing more: the call waits its time and says so
 	assert(!c.next(&ev, time::ms(300))!!);
 	c.close();
+	s.leak_check();
 }
 
 fn void client_message_during_wait_not_lost() @test
@@ -189,6 +204,7 @@ fn void client_message_during_wait_not_lost() @test
 	assert(c.next(&ev, time::sec(1))!!);
 	assert(ev.kind == EventKind.MESSAGE && ev.message.packet_id == 10 && ev.message.payload == testutil::hex("68 69"));
 	c.close();
+	s.leak_check();
 }
 
 fn void client_subscribe_closed() @test
@@ -207,6 +223,7 @@ fn void client_subscribe_closed() @test
 	assert(c.next(&ev, time::sec(1))!! && ev.kind == EventKind.CLOSED);
 	assert(@catch(c.next(&ev, time::sec(1))) == mqtt::NOT_CONNECTED);
 	c.close();
+	s.leak_check();
 }
 
 fn void client_keepalive_ping() @test
@@ -223,6 +240,7 @@ fn void client_keepalive_ping() @test
 	s.add("D0 00");
 	assert(c.next(&ev, time::ms(100))!! && ev.kind == EventKind.PONG);
 	c.close();
+	s.leak_check();
 }
 
 fn void client_keepalive_timeout_ends_the_link() @test
@@ -248,6 +266,7 @@ fn void client_keepalive_timeout_ends_the_link() @test
 	}
 	assert(got_closed && s.closed);
 	c.close();
+	s.leak_check();
 }
 
 fn void client_open_timeout() @test
@@ -285,6 +304,7 @@ fn void client_write_stall_timeout() @test
 	assert(@catch(c.publish(&m, time::ms(200))) == mqtt::TIMEOUT);
 	assert(s.closed && c.core.state == State.DISCONNECTED, "half a packet may be on the wire: the link is finished");
 	c.close();
+	s.leak_check();
 }
 
 fn void client_disconnect() @test
@@ -296,9 +316,19 @@ fn void client_disconnect() @test
 	c.disconnect(ReasonCode.NORMAL_DISCONNECTION, time::sec(1))!!;
 	assert(wrote(&s, "E0 00") && s.closed);
 	c.close();
+	s.leak_check();
 }
 
 // ---- real sockets (single thread: the kernel queues the connection and the bytes) ----
+
+// reads what the client sent, giving up after two seconds (a client that sends nothing fails the test)
+fn sz peer_read(TcpSocket* peer, char[] buf)
+{
+	Poll[1] p = { { .socket = peer.sock, .events = std::net::PollSubscribe.READ } };
+	ulong ready = std::net::poll_ms(p[..], 2000)!!;
+	assert(ready == 1, "the client sent something within two seconds");
+	return peer.read(buf)!!;
+}
 
 fn void client_over_tcp_loopback() @test
 {
@@ -316,11 +346,11 @@ fn void client_over_tcp_loopback() @test
 	Config cf = cfg();
 	c.open(mem, (Transport)&t, &cf, time::sec(5))!!;
 	char[32] buf;
-	sz n = peer.read(buf[..])!!;
+	sz n = peer_read(&peer, buf[..]);
 	assert(buf[:n] == testutil::hex("10 0D 00 04 4D 51 54 54 04 02 00 3C 00 01 61"), "the server got the CONNECT");
 	OutMessage m = { .topic = "a/b", .payload = testutil::hex("68 69") };
 	c.publish(&m, time::sec(2))!!;
-	sz k = peer.read(buf[..])!!;
+	sz k = peer_read(&peer, buf[..]);
 	assert(buf[:k] == testutil::hex("30 07 00 03 61 2F 62 68 69"));
 	c.close();
 }
@@ -345,6 +375,7 @@ fn void client_huge_timeout_does_not_wrap() @test
 	// a negative timeout means "now": one poll, no wait
 	assert(!c.next(&ev, (Duration)-5)!!);
 	c.close();
+	s.leak_check();
 }
 
 // ---- memory and reconnecting ----
@@ -434,6 +465,7 @@ fn void client_next_zero_polls_once() @test
 	assert(!c.next(&ev, time::DURATION_ZERO)!!);
 	assert(s.out_len == before + 2 && wrote(&s, "C0 00"));
 	c.close();
+	s.leak_check();
 }
 
 fn void client_next_reports_a_write_timeout_as_the_end_of_the_link() @test
@@ -451,6 +483,7 @@ fn void client_next_reports_a_write_timeout_as_the_end_of_the_link() @test
 	}
 	assert(closed && s.closed && c.core.state == State.DISCONNECTED, "not reported as 'nothing came'");
 	c.close();
+	s.leak_check();
 }
 
 // ---- a publish that times out while it waits for the window ----
@@ -515,4 +548,87 @@ fn void client_held_event_survives_calls_that_only_write() @test
 	c.disconnect(ReasonCode.NORMAL_DISCONNECTION, time::sec(1))!!;
 	assert(ev.message.topic == "a/b");
 	c.close();
+	s.leak_check();
+}
+
+// ---- more of what the client implies ----
+
+fn void client_waiting_calls_time_out_and_keep_the_connection() @test
+{
+	Script s;
+	Client c;
+	Config cf = cfg();
+	start(&c, &s, &cf);
+	SubEntry[1] entries = { { .filter = "a" } };
+	char[2] codes;
+	assert(@catch(c.subscribe(entries[..], codes[..], time::ms(300))) == mqtt::TIMEOUT);
+	assert(c.core.state == State.CONNECTED && !s.closed, "a timeout of the wait does not end the connection");
+	// the SUBACK arrives later: the request is still pending and the answer is not lost
+	s.add("90 03 00 01 00");
+	Event ev;
+	assert(c.next(&ev, time::ms(100))!! && ev.kind == EventKind.SUBSCRIBED);
+	OutMessage m = { .topic = "a", .payload = testutil::hex("01"), .qos = QoS.AT_LEAST_ONCE };
+	ushort id = c.publish(&m, time::sec(1))!!;
+	assert(@catch(c.wait_done(id, time::ms(300))) == mqtt::TIMEOUT);
+	assert(c.core.state == State.CONNECTED && c.core.inflight_count() == 1);
+	c.close();
+	s.leak_check();
+}
+
+fn void client_waiting_call_returns_queue_full_when_events_fill_the_buffer() @test
+{
+	Script s;
+	Client c;
+	Config cf = cfg();
+	cf.max_packet_size = 100;
+	cf.max_in_buffer = 150;
+	start(&c, &s, &cf);
+	// three messages of 65 bytes arrive before the SUBACK
+	for (int i = 0; i < 3; i++) s.add("30 3F 00 01 61 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F 10 11 12 13 14 15 16 17 18 19 1A 1B 1C 1D 1E 1F 20 21 22 23 24 25 26 27 28 29 2A 2B 2C 2D 2E 2F 30 31 32 33 34 35 36 37 38 39 3A 3B 3C");
+	SubEntry[1] entries = { { .filter = "a" } };
+	char[2] codes;
+	assert(@catch(c.subscribe(entries[..], codes[..], time::sec(1))) == mqtt::QUEUE_FULL);
+	// the application takes its events, then the call can be repeated
+	Event ev;
+	int n;
+	while (c.next(&ev, time::DURATION_ZERO)!! && ev.kind == EventKind.MESSAGE) n++;
+	assert(n >= 2, "the messages were not lost");
+	c.close();
+	s.leak_check();
+}
+
+fn void client_server_disconnect_during_a_wait() @test
+{
+	Script s;
+	Client c;
+	Config cf = core::default_config(Version.V5, "a");
+	s.on_write(0x10, "20 03 00 00 00");
+	s.mem_track.init(mem);
+	c.use_clock(&script_clock, &s);
+	c.open(&s.mem_track, (Transport)&s, &cf, time::sec(5))!!;
+	s.on_write(0x82, "E0 01 8E");                          // session taken over, right after the SUBSCRIBE
+	SubEntry[1] entries = { { .filter = "a" } };
+	char[2] codes;
+	assert(@catch(c.subscribe(entries[..], codes[..], time::sec(1))) == mqtt::SERVER_DISCONNECTED);
+	assert(s.closed);
+	Event ev;
+	assert(c.next(&ev, time::ms(10))!! && ev.kind == EventKind.CLOSED && ev.closed.reason == ReasonCode.SESSION_TAKEN_OVER);
+	c.close();
+	s.leak_check();
+}
+
+fn void client_reads_of_single_bytes() @test
+{
+	Script s;
+	Client c;
+	Config cf = cfg();
+	s.max_chunk = 1;
+	start(&c, &s, &cf);
+	s.on_write(0x32, "32 09 00 03 61 2F 62 00 0A 68 69 40 02 00 01");
+	OutMessage m = { .topic = "a/b", .payload = testutil::hex("68 69"), .qos = QoS.AT_LEAST_ONCE };
+	assert(c.publish_wait(&m, time::sec(5))!! == ReasonCode.SUCCESS);
+	Event ev;
+	assert(c.next(&ev, time::sec(1))!! && ev.kind == EventKind.MESSAGE && ev.message.payload == testutil::hex("68 69"));
+	c.close();
+	s.leak_check();
 }

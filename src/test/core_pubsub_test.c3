@@ -379,3 +379,51 @@ fn void refusals_server_packet_limit() @test
 	assert(s.core.pending_output().len == 0, "nothing was queued");
 	s.close();
 }
+
+// ---- taking one kind of event out of the queue (the blocking client relies on it) ----
+
+fn void poll_matching_leaves_the_other_events_in_order() @test
+{
+	Session s;
+	Config c = cfg(Version.V311);
+	s.open(&c, CONNACK_311);
+	SubEntry[1] entries = { { .filter = "a" } };
+	assert(s.core.subscribe(s.clock.now, entries[..], null)!! == 1);
+	assert(s.core.subscribe(s.clock.now, entries[..], null)!! == 2);
+	s.core.output_done(s.core.pending_output().len);
+	// a message, the answer to the second SUBSCRIBE, another message, the answer to the first
+	harness::feed(&s.core, &s.clock, "30 07 00 03 61 2F 62 68 69 90 03 00 02 01 30 07 00 03 63 2F 64 6A 6B 90 03 00 01 00");
+	Event ev;
+	assert(!s.core.poll_matching(EventKind.PUBLISH_DONE, 0, &ev), "nothing of that kind");
+	assert(!s.core.poll_matching(EventKind.SUBSCRIBED, 9, &ev), "no answer for that id");
+	assert(s.core.poll_matching(EventKind.SUBSCRIBED, 2, &ev) && ev.suback.packet_id == 2 && ev.suback.codes == testutil::hex("01"));
+	assert(s.core.poll_matching(EventKind.SUBSCRIBED, 0, &ev) && ev.suback.packet_id == 1, "id 0 means any");
+	// the rest is still there, in order
+	assert(s.core.poll_event(&ev) && ev.kind == EventKind.MESSAGE && ev.message.topic == "a/b");
+	assert(s.core.poll_event(&ev) && ev.kind == EventKind.MESSAGE && ev.message.topic == "c/d");
+	assert(!s.core.poll_event(&ev));
+	s.close();
+}
+
+fn void last_inflight_id_and_cancel_last_queued() @test
+{
+	Session s;
+	Config c = cfg(Version.V5);
+	s.open(&c, "20 06 00 00 03 21 00 01");
+	assert(s.core.last_inflight_id() == 0);
+	OutMessage a = msg_q1("a");
+	OutMessage b = msg_q1("b");
+	assert(s.core.publish(s.clock.now, &a)!! == 1);
+	assert(s.core.last_inflight_id() == 1);
+	assert(s.core.publish(s.clock.now, &b)!! == 0, "queued");
+	assert(s.core.queued_count() == 1);
+	assert(s.core.cancel_last_queued());
+	assert(s.core.queued_count() == 0 && !s.core.cancel_last_queued());
+	s.core.output_done(s.core.pending_output().len);
+	s.close();                                                  // the cancelled message was freed
+}
+
+fn OutMessage msg_q1(String topic)
+{
+	return { .topic = topic, .payload = testutil::hex("01"), .qos = QoS.AT_LEAST_ONCE };
+}
