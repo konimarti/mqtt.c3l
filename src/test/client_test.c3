@@ -412,3 +412,43 @@ fn void client_reconnect_keeps_the_session() @test
 	assert(t.allocation_count() == 0);
 	t.free();
 }
+
+// ---- polling and the end of the link inside next ----
+
+fn void client_next_zero_polls_once() @test
+{
+	Script s;
+	Client c;
+	Config cf = cfg(1);
+	start(&c, &s, &cf);
+	s.add("30 07 00 03 61 2F 62 68 69");
+	Event ev;
+	assert(c.next(&ev, time::DURATION_ZERO)!!, "a readable message with a zero timeout");
+	assert(ev.kind == EventKind.MESSAGE);
+	// nothing readable and no timer due: false, and the connection is untouched
+	assert(!c.next(&ev, time::DURATION_ZERO)!!);
+	assert(c.core.state == State.CONNECTED);
+	// a due timer runs on a poll as well: the keep-alive PINGREQ goes out
+	s.now = s.now + time::ms(800);
+	usz before = s.out_len;
+	assert(!c.next(&ev, time::DURATION_ZERO)!!);
+	assert(s.out_len == before + 2 && wrote(&s, "C0 00"));
+	c.close();
+}
+
+fn void client_next_reports_a_write_timeout_as_the_end_of_the_link() @test
+{
+	Script s;
+	Client c;
+	Config cf = cfg(1);
+	start(&c, &s, &cf);
+	s.stall_writes = true;                                    // the PINGREQ cannot be written
+	Event ev;
+	bool closed;
+	for (int i = 0; i < 3 && !closed; i++)
+	{
+		if (c.next(&ev, time::ms(1500))!! && ev.kind == EventKind.CLOSED) closed = true;
+	}
+	assert(closed && s.closed && c.core.state == State.DISCONNECTED, "not reported as 'nothing came'");
+	c.close();
+}

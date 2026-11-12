@@ -103,6 +103,7 @@ fn void? Client.wait_connected(&self, Duration deadline)
 		if (self.core.poll_matching(EventKind.CONNECTED, 0, &ev)) return;
 		if (catch err = self.pump(deadline))
 		{
+			if (self.core.poll_matching(EventKind.CONNECTED, 0, &ev)) return;
 			// no CONNACK in time: the attempt is over, the link is not kept
 			if (err == mqtt::TIMEOUT && self.core.state != State.DISCONNECTED) self.link_dead();
 			return err~;
@@ -144,7 +145,11 @@ fn ReasonCode? Client.wait_done(&self, ushort id, Duration timeout)
 	while (true)
 	{
 		if (self.core.poll_matching(EventKind.PUBLISH_DONE, id, &ev)) return ev.done.reason;
-		self.pump(deadline)!;
+		if (catch err = self.pump(deadline))
+		{
+			if (self.core.poll_matching(EventKind.PUBLISH_DONE, id, &ev)) return ev.done.reason;
+			return err~;
+		}
 	}
 }
 
@@ -184,7 +189,17 @@ fn usz? Client.wait_answer(&self, EventKind kind, ushort id, char[] codes_out, D
 			codes_out[:n] = ev.suback.codes[:n];
 			return ev.suback.codes.len;
 		}
-		self.pump(deadline)!;
+		if (catch err = self.pump(deadline))
+		{
+			// what arrived in the last round still counts
+			if (self.core.poll_matching(kind, id, &ev))
+			{
+				usz n = ev.suback.codes.len < codes_out.len ? ev.suback.codes.len : codes_out.len;
+				codes_out[:n] = ev.suback.codes[:n];
+				return ev.suback.codes.len;
+			}
+			return err~;
+		}
 	}
 }
 
@@ -199,13 +214,14 @@ fn bool? Client.next(&self, Event* ev, Duration timeout)
 	{
 		if (self.core.poll_event(ev)) return true;
 		if (self.core.state == State.DISCONNECTED) return mqtt::NOT_CONNECTED~;
-		if (self.now() >= deadline) return false;
-		if (catch err = self.pump(deadline))
+		fault stop;
+		if (catch err = self.pump(deadline)) stop = err;
+		if (self.core.poll_event(ev)) return true;       // what the round brought, the CLOSED event of a link that ended included
+		if (stop)
 		{
-			if (err == mqtt::TIMEOUT) return false;
-			// the connection ended: the CLOSED event tells how
-			if (self.core.poll_event(ev)) return true;
-			return err~;
+			// a read or a write that ran out of time ended the link: that is not "nothing came"
+			if (stop == mqtt::TIMEOUT && self.core.state != State.DISCONNECTED) return false;
+			return stop~;
 		}
 	}
 }
@@ -252,8 +268,7 @@ fn void? Client.pump(&self, Duration deadline)
 {
 	self.flush(deadline)!;
 	Duration now = self.now();
-	if (now >= deadline) return mqtt::TIMEOUT~;
-	Duration wait = deadline - now;
+	Duration wait = deadline > now ? deadline - now : time::DURATION_ZERO;           // a deadline that has passed still polls once
 	Duration timer;
 	if (self.core.next_deadline(&timer))
 	{
@@ -288,4 +303,5 @@ fn void? Client.pump(&self, Duration deadline)
 		return err~;
 	}
 	self.flush(deadline)!;
+	if (self.now() >= deadline) return mqtt::TIMEOUT~;                                // the caller looks at what the round brought first
 }
