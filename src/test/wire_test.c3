@@ -273,3 +273,15 @@ fn void reader_writer_round_trip() @test
 	assert(r.binary()!! == testutil::hex("00 01 02"));
 	assert(r.remaining() == 0);
 }
+
+fn void utf8_text_has_no_length_limit_and_allows_nul() @test
+{
+	char[] big = mem::temp_array(char, 70_000);
+	big[..] = 'a';
+	assert(!@catch(wire::validate_utf8_text((String)big)), "text of any length");
+	assert(@catch(wire::validate_utf8((String)big)) == mqtt::INVALID_UTF8, "a UTF-8 Encoded String is limited to 65535 bytes");
+	assert(!@catch(wire::validate_utf8_text((String)testutil::hex("61 00 62"))), "U+0000 is fine in text, not in a string");
+	assert(@catch(wire::validate_utf8((String)testutil::hex("61 00 62"))) == mqtt::INVALID_UTF8);
+	assert(@catch(wire::validate_utf8_text((String)testutil::hex("C0 80"))) == mqtt::INVALID_UTF8);
+	assert(@catch(wire::validate_utf8_text((String)testutil::hex("ED A0 80"))) == mqtt::INVALID_UTF8);
+}
