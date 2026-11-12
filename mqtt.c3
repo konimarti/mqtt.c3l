@@ -6,7 +6,8 @@ module mqtt;
 // "this call failed", the ReasonCode is the byte on the wire (0x81, 0x82, 0x95). The qualification
 // always tells them apart; c3_refs rename_to works per namespace.
 
-// Faults: see DESIGN.md section 6.
+// Library faults. Parse and protocol faults are returned by the codec and the session core;
+// CLOSED and TIMEOUT come from transports.
 faultdef
 	MALFORMED_PACKET,       // bytes do not parse (MQTT-5.0 4.13, 3.1.1 4.8)
 	PROTOCOL_ERROR,         // well-formed but not allowed in this state

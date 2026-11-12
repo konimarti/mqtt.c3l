@@ -50,7 +50,7 @@ struct UserProperty
 // Decoded property list. Strings and binaries borrow from the packet bytes (decode) or from
 // the caller (encode). A field counts only when its bit is set in `present`.
 // Re-encoding a decoded struct works: encode uses `user` / `subscription_ids` when non-empty and
-// otherwise falls back to `user_raw` / `subid_raw` (tested in M4 and M5).
+// otherwise falls back to `user_raw` / `subid_raw`.
 struct Properties
 {
 	ulong present;                  // bit (1 << id) for ids below 64
