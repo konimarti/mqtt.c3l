@@ -336,3 +336,21 @@ fn void input_room_lets_a_big_read_make_progress() @test
 	assert(@catch(s.core.input(s.clock.now, all[:151])) == mqtt::QUEUE_FULL, "more than the room is still refused");
 	s.close();
 }
+
+// a message that could never fit the output buffer is refused at once, whether or not the window has room
+fn void oversized_message_is_refused_even_when_the_window_is_full() @test
+{
+	Session s;
+	Config c = cfg(Version.V5);
+	c.max_out_buffer = 100;
+	s.open(&c, "20 06 00 00 03 21 00 01");                       // window of 1
+	OutMessage first = msg(QoS.AT_LEAST_ONCE, "01");
+	s.core.publish(s.clock.now, &first)!!;                       // takes the window
+	char[] payload = mem::temp_array(char, 150);
+	payload[..] = 'p';
+	OutMessage big = { .topic = "t", .payload = payload, .qos = QoS.AT_LEAST_ONCE };
+	assert(@catch(s.core.publish(s.clock.now, &big)) == mqtt::QUEUE_FULL, "it would wait forever");
+	assert(s.core.queued_count() == 0);
+	s.core.output_done(s.core.pending_output().len);
+	s.close();
+}

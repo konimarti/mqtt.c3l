@@ -1662,7 +1662,8 @@ fn ushort? Core.publish_acknowledged(&self, Duration now, OutMessage* msg)
 	Packet probe = { .type = PacketType.PUBLISH };
 	probe.publish = { .qos = msg.qos, .topic = msg.topic, .payload = msg.payload, .packet_id = 1 };
 	if (is_v5(&self.config)) probe.publish.props = msg.props;
-	packet::encoded_size(self.config.version, &probe)!;           // refuses what could never be sent
+	usz size = packet::encoded_size(self.config.version, &probe)!;           // refuses what could never be sent
+	if (size > self.config.effective_max_out_buffer()) return mqtt::QUEUE_FULL~;      // it would never fit: waiting would not help
 	self.check_outbound_size(&probe)!;
 	Inflight r = self.make_record(now, msg, explicit)!;
 	if (self.queue.len() > 0 || self.inflight.len() >= (sz)self.limits.send_quota)
