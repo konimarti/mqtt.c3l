@@ -111,6 +111,18 @@ fn usz? TcpTransport.read(&self, char[] buf, Duration timeout) @dynamic
 	}
 }
 
+// A write that ran out of time after some of the bytes went out has left part of a packet on the wire: sending the
+// whole of it again would put duplicate bytes in the stream and the rest alone cannot be told apart by the caller. The
+// link is closed, so that a retry fails with CLOSED instead. A timeout before the first byte left changes nothing and
+// can be retried.
+fn fault broken_after_partial(TcpTransport* self, usz written, fault cause) @private
+{
+	if (written == 0) return cause;
+	self.open = false;
+	(void)self.sock.close();
+	return cause;
+}
+
 fn void? TcpTransport.write(&self, char[] data, Duration timeout) @dynamic
 {
 	if (!self.open) return mqtt::CLOSED~;
@@ -125,7 +137,7 @@ fn void? TcpTransport.write(&self, char[] data, Duration timeout) @dynamic
 			if (err == io::INTERRUPTED) continue;
 			return mqtt::CLOSED~;
 		}
-		if (ready == 0) return mqtt::TIMEOUT~;
+		if (ready == 0) return broken_after_partial(self, off, mqtt::TIMEOUT)~;
 		usz chunk = data.len - off;
 		if (chunk > SEND_CHUNK) chunk = SEND_CHUNK;
 		sz? n = raw_send(self, data[off:chunk]);
@@ -134,7 +146,7 @@ fn void? TcpTransport.write(&self, char[] data, Duration timeout) @dynamic
 			if (err == io::INTERRUPTED) continue;
 			if (err == io::WOULD_BLOCK)
 			{
-				if (remaining_ms(deadline) == 0) return mqtt::TIMEOUT~;
+				if (remaining_ms(deadline) == 0) return broken_after_partial(self, off, mqtt::TIMEOUT)~;
 				continue;
 			}
 			return mqtt::CLOSED~;

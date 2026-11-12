@@ -113,3 +113,18 @@ fn void tcp_write_to_closed_peer() @test
 	}
 	assert(f == mqtt::CLOSED, "fault, not a signal");
 }
+
+// After a write that went out only in part and then timed out the link is finished: the whole packet must not be sent
+// again behind its first part.
+fn void tcp_partial_write_timeout_ends_the_link() @test
+{
+	Pair p = open_pair();
+	defer close_pair(&p);
+	usz size = 64 * 1024 * 1024;
+	char[] big = mem::new_array(char, (sz)size);
+	defer free(big);
+	big[..] = 'z';
+	assert(@catch(p.client.write(big, time::ms(200))) == mqtt::TIMEOUT);
+	char[4] more = { 1, 2, 3, 4 };
+	assert(@catch(p.client.write(more[..], time::ms(100))) == mqtt::CLOSED, "a retry must fail, not resend");
+}

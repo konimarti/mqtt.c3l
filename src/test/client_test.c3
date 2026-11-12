@@ -25,6 +25,7 @@ struct Script
 	usz nrules;
 	bool eof;
 	bool stall_writes;
+	usz accept_then_stall;          // write: take this many bytes of the next write, then time out (0 = off)
 	bool closed;
 	usz max_chunk;                  // read at most this many bytes at a time (0 = no limit)
 	Duration now;
@@ -62,6 +63,16 @@ fn usz? Script.read(&self, char[] buf, Duration timeout) @dynamic
 fn void? Script.write(&self, char[] data, Duration timeout) @dynamic
 {
 	if (self.closed) return mqtt::CLOSED~;
+	if (self.accept_then_stall > 0)
+	{
+		usz n = self.accept_then_stall < data.len ? self.accept_then_stall : data.len;
+		self.written[self.out_len:n] = data[:n];
+		self.out_len += n;
+		self.accept_then_stall = 0;
+		self.stall_writes = true;
+		self.now = self.now + timeout;
+		return mqtt::TIMEOUT~;
+	}
 	if (self.stall_writes)
 	{
 		self.now = self.now + timeout;
@@ -669,6 +680,26 @@ fn void client_reconnect_refused_cases_keep_the_link() @test
 	c.publish(&m, time::sec(1))!!;
 	assert(wrote(&s, "30 04 00 01 61 01"), "written to the link that is connected");
 	assert(other.out_len == 0, "nothing went to the refused transport");
+	c.close();
+	s.leak_check();
+}
+
+// A write that took only part of a packet and then timed out must not be repeated: the client ends the link and
+// never sends the packet, or the rest of it, again.
+fn void client_partial_write_ends_the_link_and_is_never_repeated() @test
+{
+	Script s;
+	Client c;
+	Config cf = cfg();
+	start(&c, &s, &cf);
+	usz before = s.out_len;
+	s.accept_then_stall = 3;
+	OutMessage m = { .topic = "a/b", .payload = testutil::hex("68 69"), .qos = QoS.AT_LEAST_ONCE };
+	assert(@catch(c.publish(&m, time::ms(100))) == mqtt::TIMEOUT);
+	assert(s.out_len == before + 3, "only the part the peer took was written");
+	assert(s.closed && c.core.state == State.DISCONNECTED, "the link is finished");
+	assert(@catch(c.publish(&m, time::ms(100))) == mqtt::NOT_CONNECTED, "a retry does not reach the wire");
+	assert(s.out_len == before + 3, "nothing was written again");
 	c.close();
 	s.leak_check();
 }
