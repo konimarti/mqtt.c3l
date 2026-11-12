@@ -261,7 +261,7 @@ struct Inflight
 
 enum PendingKind : char { SUBSCRIBE, UNSUBSCRIBE }
 struct PendingAck { ushort id; PendingKind kind; usz count; }
-struct AliasEntry { ushort alias_id; String topic; ulong used; }
+struct AliasEntry { ushort alias_id; String topic; ulong used; usz topic_off; bool in_topics; }
 
 // A queued event. The frame it came from stays in in_buf until the queue is drained.
 struct EventRec
@@ -589,7 +589,12 @@ fn void? Core.input(&self, Duration now, char[] data)
 		self.in_buf.size = left;
 		self.in_consumed = 0;
 	}
-	if (self.pending_events() == 0) self.topics.clear();                  // the topics of delivered events are not needed any more
+	if (self.pending_events() == 0)
+	{
+		// the topics of delivered events are not needed any more
+		self.topics.clear();
+		for (sz i = 0; i < self.alias_in.len(); i++) self.alias_in.entries[i].in_topics = false;
+	}
 	if ((usz)self.in_buf.len() + data.len > self.config.effective_max_in_buffer()) return mqtt::QUEUE_FULL~;
 	self.last_rx = t;
 	self.in_buf.push_all(data);
@@ -1281,6 +1286,7 @@ fn void? Core.resolve_alias_in(&self, Publish* u, EventRec* rec)
 		{
 			self.alias_in.entries[at].topic.free(self.allocator);
 			self.alias_in.entries[at].topic = copy;
+			self.alias_in.entries[at].in_topics = false;
 		}
 		else
 		{
@@ -1289,11 +1295,17 @@ fn void? Core.resolve_alias_in(&self, Publish* u, EventRec* rec)
 		return;
 	}
 	if (at < 0) return mqtt::TOPIC_ALIAS_INVALID~;                   // an alias that was never bound on this connection
-	String bound = self.alias_in.entries[at].topic;
+	// every message of a binding shares one copy of its topic in `topics`
+	AliasEntry* entry = &self.alias_in.entries[at];
+	if (!entry.in_topics)
+	{
+		entry.topic_off = (usz)self.topics.len();
+		entry.in_topics = true;
+		self.topics.push_all((char[])entry.topic);
+	}
 	rec.has_topic = true;
-	rec.topic_off = (usz)self.topics.len();
-	rec.topic_len = bound.len;
-	self.topics.push_all((char[])bound);
+	rec.topic_off = entry.topic_off;
+	rec.topic_len = entry.topic.len;
 }
 
 // What to send for the topic of an outbound PUBLISH: nothing special, the topic and an alias that binds it,

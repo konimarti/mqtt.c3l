@@ -289,3 +289,33 @@ fn void alias_out_lru_same_instant() @test
 	}
 	s.close();
 }
+
+// many messages that use one binding share one copy of its topic
+fn void alias_in_alias_only_messages_share_the_topic_copy() @test
+{
+	Session s;
+	Config c = cfg();
+	c.topic_alias_maximum = 1;
+	s.open(&c, CONNACK_5);
+	char[] topic = mem::temp_array(char, 100);
+	topic[..] = 'x';
+	char[] bind = mem::temp_array(char, 108);
+	char[] head = testutil::hex("30 6A 00 64");
+	bind[:4] = head[..];
+	bind[4:100] = topic[..];
+	char[] tail = testutil::hex("03 23 00 01");
+	bind[104:4] = tail[..];
+	s.core.input(s.clock.now, bind)!!;
+	char[] only = testutil::hex("30 06 00 00 03 23 00 01");
+	for (int i = 0; i < 1000; i++) s.core.input(s.clock.now, only)!!;
+	assert(s.core.topics.len() <= 100, "one copy for the binding, not one per message");
+	int n;
+	Event ev;
+	while (s.core.poll_event(&ev))
+	{
+		assert(ev.message.topic.len == 100 && ev.message.topic[0] == 'x' && ev.message.topic[99] == 'x');
+		n++;
+	}
+	assert(n == 1001);
+	s.close();
+}
