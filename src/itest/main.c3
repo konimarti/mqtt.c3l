@@ -608,6 +608,7 @@ fn void? restart_prepare()
 {
 	Conn a, b;
 	a.init("itest-rs", false);
+	a.config.client_id = "itest-rs";                            // the same id in both parts, also when they are run by hand
 	if (version == Version.V5) a.config.session_expiry = 600;
 	a.connect()!;
 	a.subscribe("itest/restart", QoS.EXACTLY_ONCE)!;
@@ -621,11 +622,17 @@ fn void? restart_check()
 {
 	Conn a;
 	a.init("itest-rs", false);
+	a.config.client_id = "itest-rs";
 	if (version == Version.V5) a.config.session_expiry = 600;
 	a.connect()!;
 	defer a.end();
 	Got g;
-	if (!a.recv(&g, 3000)!) return skip(string::format(mem, "%s lost the session over the restart", peer_kind));
+	if (!a.recv(&g, 3000)!)
+	{
+		// mosquitto runs with persistence in this group: losing the session is a failure there, not a limit of the broker
+		expect(peer_kind != "mosquitto", "the session was lost over the restart although persistence is on")!;
+		return skip(string::format(mem, "%s lost the session over the restart", peer_kind));
+	}
 	expect(g.payload == "survives" && g.qos == QoS.EXACTLY_ONCE, "wrong message after the restart")!;
 }
 
@@ -741,7 +748,7 @@ Scenario[*] scenarios = {
 	{ "limits_topic_alias", "limits", true, &limits_topic_alias },
 	{ "limits_max_qos", "limits", true, &limits_max_qos },
 	{ "limits_retain", "limits", true, &limits_retain },
-	{ "limits_auth", "limits", true, &limits_auth },
+	{ "limits_auth", "limits", false, &limits_auth },
 	{ "session_offline_queue", "sessions", false, &session_offline_queue },
 	{ "session_takeover", "sessions", false, &session_takeover },
 	{ "restart_prepare", "restart", false, &restart_prepare },
