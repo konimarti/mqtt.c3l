@@ -1413,6 +1413,7 @@ fn void? Core.handle_ack(&self, Duration now, usz off, usz n, Packet* p)
 						self.send_pubrel(now, a.packet_id, 0)!;
 					}
 				case InflightState.WAIT_PUBCOMP:
+					r.needs_resend = false;                               // answered now: nothing left to send again
 					self.send_pubrel(now, a.packet_id, 0)!;               // the PUBREC again: answer again
 				default:
 					return self.fail(now, mqtt::PROTOCOL_ERROR);

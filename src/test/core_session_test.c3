@@ -555,3 +555,33 @@ fn void session_cycles_do_not_leak() @test
 	}
 	s.close();
 }
+
+// ---- a PUBREC for a record that has not been sent again yet ----
+
+fn void pubrel_is_not_sent_twice_for_a_waiting_record() @test
+{
+	Session s;
+	Config c = cfg(Version.V5);
+	s.open(&c, CONNACK_5);
+	OutMessage a = msg(QoS.EXACTLY_ONCE, 1);
+	OutMessage b = msg(QoS.EXACTLY_ONCE, 2);
+	s.core.publish(s.clock.now, &a)!!;
+	s.core.publish(s.clock.now, &b)!!;
+	s.core.output_done(s.core.pending_output().len);
+	harness::feed(&s.core, &s.clock, "50 02 00 01");
+	harness::feed(&s.core, &s.clock, "50 02 00 02");
+	s.core.output_done(s.core.pending_output().len);
+	lose(&s);
+	// the new server takes one record at a time: PUBREL for the first only
+	reconnect(&s, "20 06 01 00 03 21 00 01");
+	harness::expect_out(&s.core, "62 02 00 01");
+	// the server answers the PUBREC of the second record anyway: it gets its PUBREL once
+	harness::feed(&s.core, &s.clock, "50 02 00 02");
+	harness::expect_out(&s.core, "62 02 00 02");
+	harness::feed(&s.core, &s.clock, "70 02 00 01");
+	harness::expect_no_out(&s.core);
+	assert(s.core.inflight_count() == 1);
+	harness::feed(&s.core, &s.clock, "70 02 00 02");
+	assert(s.core.inflight_count() == 0);
+	s.close();
+}
