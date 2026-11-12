@@ -541,11 +541,22 @@ fn void? Core.connect(&self, Duration now)
 
 // ---- input ----
 
+// How many bytes input() accepts now: the adapter reads at most this much from the transport (when it is 0,
+// the application has to take its events first). Bytes of frames that were all delivered do not count.
+fn usz Core.input_room(&self)
+{
+	usz held = (usz)self.in_buf.len();
+	if (self.pending_events() == 0) held -= (usz)self.in_consumed;
+	usz limit = self.config.effective_max_in_buffer();
+	return held >= limit ? 0 : limit - held;
+}
+
 // Feed bytes read from the transport (any split, including mid-packet). Complete frames are
 // processed in order. A fault means the connection is over: a CLOSED event was queued (and for 5.0 a
 // DISCONNECT where the protocol asks for one); the caller flushes pending_output, closes the transport and
-// calls transport_closed. QUEUE_FULL (undelivered input over max_in_buffer) consumes nothing: take the
-// events, then feed the bytes again.
+// calls transport_closed. Pass at most input_room() bytes: more than that is QUEUE_FULL, which consumes
+// nothing (take the events, then feed the bytes again); a read that is larger than the whole buffer could
+// never be accepted, so an adapter sizes its reads by input_room().
 fn void? Core.input(&self, Duration now, char[] data)
 {
 	Duration t = self.tick(now);

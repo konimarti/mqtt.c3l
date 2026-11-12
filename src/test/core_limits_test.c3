@@ -302,3 +302,37 @@ fn void disconnect_reasons_table() @test
 	expect_failure(Version.V311, &c3, CONNACK_311, "20 02 00 00", mqtt::PROTOCOL_ERROR, "");
 	expect_failure(Version.V311, &c3, CONNACK_311, "30 E8 07", mqtt::PACKET_TOO_LARGE, "");
 }
+
+// An adapter reads at most input_room() bytes at a time, and takes the events when the room is used up.
+fn void input_room_lets_a_big_read_make_progress() @test
+{
+	Session s;
+	Config c = cfg(Version.V5);
+	c.max_packet_size = 100;
+	c.max_in_buffer = 150;
+	s.open(&c, CONNACK_5);
+	assert(s.core.input_room() == 150, "everything is free when nothing is held");
+	// three frames of 65 bytes, 195 bytes in all: more than the buffer can hold at once
+	String frame = "30 3F 00 01 61 00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F 10 11 12 13 14 15 16 17 18 19 1A 1B 1C 1D 1E 1F 20 21 22 23 24 25 26 27 28 29 2A 2B 2C 2D 2E 2F 30 31 32 33 34 35 36 37 38 39 3A 3B";
+	char[] one = testutil::hex(frame);
+	char[] all = mem::temp_array(char, 3 * one.len);
+	for (usz i = 0; i < 3; i++) all[i * one.len:one.len] = one[..];
+	usz pos;
+	int delivered;
+	while (pos < all.len)
+	{
+		usz room = s.core.input_room();
+		if (room == 0)
+		{
+			delivered += (int)harness::drain(&s.core).len;       // the application takes what is waiting
+			continue;
+		}
+		usz n = all.len - pos < room ? all.len - pos : room;
+		s.core.input(s.clock.now, all[pos:n])!!;
+		pos += n;
+	}
+	delivered += (int)harness::drain(&s.core).len;
+	assert(delivered == 3, "all three messages arrived");
+	assert(@catch(s.core.input(s.clock.now, all[:151])) == mqtt::QUEUE_FULL, "more than the room is still refused");
+	s.close();
+}
