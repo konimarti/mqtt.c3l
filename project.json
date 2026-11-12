@@ -7,6 +7,10 @@
 		"mqttc": {
 			"type": "executable",
 			"sources": [ "src/mqttc/main.c3" ]
+		},
+		"itest": {
+			"type": "executable",
+			"sources": [ "src/itest/**" ]
 		}
 	}
 }
