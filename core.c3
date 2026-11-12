@@ -368,9 +368,40 @@ fn sz Core.pending_events(&self) => self.events.len() - self.event_head;
 
 // ---- output ----
 
+// Acknowledgements, DISCONNECT and AUTH that the core generates leave out their Reason String and User
+// Properties when including them would exceed the server's Maximum Packet Size [5.0 3.1.2.11.4].
+fn void Core.trim_for_server(&self, Packet* p)
+{
+	if (self.limits.max_packet_size == 0 || !is_v5(&self.config)) return;
+	Properties* pr;
+	switch (p.type)
+	{
+		case PacketType.PUBACK:
+		case PacketType.PUBREC:
+		case PacketType.PUBREL:
+		case PacketType.PUBCOMP:
+			pr = &p.ack.props;
+		case PacketType.DISCONNECT:
+			pr = &p.disconnect.props;
+		case PacketType.AUTH:
+			pr = &p.auth.props;
+		default:
+			return;
+	}
+	usz? size = packet::encoded_size(self.config.version, p);
+	if (catch err = size) return;                       // the encoder reports what is wrong
+	if (size <= self.limits.max_packet_size) return;
+	pr.present &= ~(1UL << (uint)(char)PropId.REASON_STRING);
+	pr.present &= ~(1UL << (uint)(char)PropId.USER_PROPERTY);
+	pr.reason_string = "";
+	pr.user = {};
+	pr.user_raw = {};
+}
+
 // Appends a packet to the output buffer; the limits of the buffer apply.
 fn void? Core.queue_packet(&self, Duration now, Packet* p)
 {
+	self.trim_for_server(p);
 	usz size = packet::encoded_size(self.config.version, p)!;
 	if ((usz)self.out_buf.len() + size > self.config.effective_max_out_buffer()) return mqtt::QUEUE_FULL~;
 	self.out_buf.reserve((sz)size);
@@ -576,6 +607,10 @@ fn void? Core.handle_publish(&self, Duration now, usz off, usz n, Packet* p)
 	if (self.state != State.CONNECTED) return;
 	// topic aliases are not negotiated: a PUBLISH that relies on one is a protocol violation
 	if (u.topic.len == 0 || u.props.has(PropId.TOPIC_ALIAS)) return self.fail(now, mqtt::PROTOCOL_ERROR);
+	if (self.config.validate_payload_utf8 && u.props.has(PropId.PAYLOAD_FORMAT_INDICATOR) && u.props.payload_format == 1)
+	{
+		if (catch err = wire::validate_utf8_text((String)u.payload)) return self.fail(now, mqtt::PAYLOAD_FORMAT_INVALID);
+	}
 	switch (u.qos)
 	{
 		case QoS.AT_MOST_ONCE:
@@ -589,6 +624,8 @@ fn void? Core.handle_publish(&self, Duration now, usz off, usz n, Packet* p)
 			// delivered once: a repeated PUBLISH of an id that is still being completed only gets the PUBREC again
 			if (!self.in_qos2.contains(u.packet_id))
 			{
+				// more unfinished QoS 2 messages than the Receive Maximum we announced
+				if (is_v5(&self.config) && (usz)self.in_qos2.len() >= self.config.effective_receive_maximum()) return self.fail(now, mqtt::RECEIVE_MAXIMUM_EXCEEDED);
 				self.in_qos2.push(u.packet_id);
 				self.events.push({ .kind = EventKind.MESSAGE, .frame_off = off, .frame_len = n });
 			}
@@ -703,6 +740,8 @@ fn void Core.emit_closed(&self, Duration now, fault cause, ReasonCode reason, bo
 fn ReasonCode reason_for(fault cause) @private
 {
 	if (cause == mqtt::PACKET_TOO_LARGE) return ReasonCode.PACKET_TOO_LARGE;
+	if (cause == mqtt::RECEIVE_MAXIMUM_EXCEEDED) return ReasonCode.RECEIVE_MAXIMUM_EXCEEDED;
+	if (cause == mqtt::PAYLOAD_FORMAT_INVALID) return ReasonCode.PAYLOAD_FORMAT_INVALID;
 	if (cause == mqtt::PROTOCOL_ERROR || cause == mqtt::INVALID_PROPERTY) return ReasonCode.PROTOCOL_ERROR;
 	if (cause == mqtt::INVALID_TOPIC_NAME) return ReasonCode.TOPIC_NAME_INVALID;
 	if (cause == mqtt::UNSUPPORTED_VERSION) return ReasonCode.UNSUPPORTED_PROTOCOL_VERSION;
