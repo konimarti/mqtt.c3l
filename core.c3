@@ -408,6 +408,7 @@ fn void? Core.connect(&self, Duration now)
 	Duration t = self.tick(now);
 	self.out_buf.clear();
 	self.in_buf.size = self.in_consumed;             // bytes of an earlier connection are void
+	self.pending.clear();
 	self.closed_seen = false;
 	self.reached_connected = false;
 	self.ping_outstanding = false;
@@ -543,9 +544,63 @@ fn void? Core.handle_frame(&self, Duration now, usz off, usz n)
 			if (!is_v5(&self.config)) return self.fail(now, mqtt::PROTOCOL_ERROR);
 			self.emit_closed(now, mqtt::SERVER_DISCONNECTED, (ReasonCode)p.disconnect.reason, true, off, n);
 			return mqtt::SERVER_DISCONNECTED~;
+		case PacketType.PUBLISH:
+			self.handle_publish(now, off, n, p)!;
+		case PacketType.SUBACK:
+		case PacketType.UNSUBACK:
+			self.handle_suback(now, off, n, p)!;
 		default:
-			// publications, acknowledgements and subscription replies are handled by the QoS flows
+			// acknowledgements of our own publications are handled by the QoS flows
 			break;
+	}
+}
+
+// An inbound PUBLISH: queue the MESSAGE event, then the acknowledgement. Both happen here, in the
+// order the packets arrive, whether or not the application polls for events.
+fn void? Core.handle_publish(&self, Duration now, usz off, usz n, Packet* p)
+{
+	Publish* u = &p.publish;
+	if (self.state != State.CONNECTED) return;
+	// topic aliases are not negotiated: a PUBLISH that relies on one is a protocol violation
+	if (u.topic.len == 0 || u.props.has(PropId.TOPIC_ALIAS)) return self.fail(now, mqtt::PROTOCOL_ERROR);
+	switch (u.qos)
+	{
+		case QoS.AT_MOST_ONCE:
+			self.events.push({ .kind = EventKind.MESSAGE, .frame_off = off, .frame_len = n });
+		case QoS.AT_LEAST_ONCE:
+			self.events.push({ .kind = EventKind.MESSAGE, .frame_off = off, .frame_len = n });
+			Packet ack = { .type = PacketType.PUBACK };
+			ack.ack.packet_id = u.packet_id;
+			if (catch err = self.queue_packet(now, &ack)) return self.fail(now, err);
+		case QoS.EXACTLY_ONCE:
+			// delivered once: a repeated PUBLISH of an id that is still being completed only gets the PUBREC again
+			if (!self.in_qos2.contains(u.packet_id))
+			{
+				self.in_qos2.push(u.packet_id);
+				self.events.push({ .kind = EventKind.MESSAGE, .frame_off = off, .frame_len = n });
+			}
+			Packet rec = { .type = PacketType.PUBREC };
+			rec.ack.packet_id = u.packet_id;
+			if (catch err = self.queue_packet(now, &rec)) return self.fail(now, err);
+	}
+}
+
+// SUBACK / UNSUBACK: completes the matching request. A reply for an id we do not wait for is ignored.
+fn void? Core.handle_suback(&self, Duration now, usz off, usz n, Packet* p)
+{
+	SubAck* a = &p.suback;
+	PendingKind kind = p.type == PacketType.SUBACK ? PendingKind.SUBSCRIBE : PendingKind.UNSUBSCRIBE;
+	for (sz i = 0; i < self.pending.len(); i++)
+	{
+		PendingAck pa = self.pending[i];
+		if (pa.id != a.packet_id || pa.kind != kind) continue;
+		// one code per filter (a 3.1.1 UNSUBACK carries none)
+		bool has_codes = kind == PendingKind.SUBSCRIBE || is_v5(&self.config);
+		if (has_codes && a.codes.len != pa.count) return self.fail(now, mqtt::PROTOCOL_ERROR);
+		self.pending.remove_at(i);
+		EventKind ek = kind == PendingKind.SUBSCRIBE ? EventKind.SUBSCRIBED : EventKind.UNSUBSCRIBED;
+		self.events.push({ .kind = ek, .frame_off = off, .frame_len = n });
+		return;
 	}
 }
 
@@ -608,6 +663,7 @@ fn void? Core.handle_connack(&self, Duration now, usz off, usz n, Packet* p)
 fn void Core.emit_closed(&self, Duration now, fault cause, ReasonCode reason, bool by_server, usz off, usz n)
 {
 	self.state = State.DISCONNECTED;
+	self.pending.clear();                          // a SUBSCRIBE or UNSUBSCRIBE is not repeated on a new connection
 	if (self.closed_seen) return;
 	self.closed_seen = true;
 	if (self.reached_connected) self.closed_at = now;
@@ -701,6 +757,22 @@ fn bool Core.poll_event(&self, Event* ev)
 					if (q.type == PacketType.DISCONNECT) ev.closed.server_reference = q.disconnect.props.server_reference;
 				}
 			}
+		case EventKind.MESSAGE:
+			Packet p = packet::decode(self.config.version, self.in_buf.entries[rec.frame_off:rec.frame_len])!!;
+			Publish* u = &p.publish;
+			ev.message = {
+				.topic = u.topic,
+				.payload = u.payload,
+				.qos = u.qos,
+				.retain = u.retain,
+				.dup = u.dup,
+				.packet_id = u.packet_id,
+				.props = u.props,
+			};
+		case EventKind.SUBSCRIBED:
+		case EventKind.UNSUBSCRIBED:
+			Packet p = packet::decode(self.config.version, self.in_buf.entries[rec.frame_off:rec.frame_len])!!;
+			ev.suback = { .packet_id = p.suback.packet_id, .codes = p.suback.codes, .props = p.suback.props };
 		default:
 			break;
 	}
@@ -772,6 +844,7 @@ fn void Core.transport_closed(&self, Duration now)
 		self.emit_closed(t, cause, ReasonCode.UNSPECIFIED_ERROR, false, 0, 0);
 	}
 	self.out_buf.clear();
+	self.pending.clear();
 	self.in_buf.size = self.in_consumed;
 	self.ping_outstanding = false;
 }
@@ -794,14 +867,122 @@ fn void? Core.disconnect(&self, Duration now, ReasonCode reason, Properties* pro
 	self.state = State.DISCONNECTING;
 }
 
-// Returns the packet id (0 for QoS 0; 0 is never a valid id, [5.0 2.2.1]).
+// Next free packet id (1..65535, never 0), skipping ids that are in use.
+fn ushort? Core.alloc_id(&self)
+{
+	for (int tries = 0; tries < 65_535; tries++)
+	{
+		ushort id = self.next_id == 0 ? 1 : self.next_id;
+		self.next_id = id == 65_535 ? 1 : (ushort)(id + 1);
+		if (!self.id_in_use(id)) return id;
+	}
+	return mqtt::PACKET_ID_EXHAUSTED~;
+}
+
+fn bool Core.id_in_use(&self, ushort id)
+{
+	foreach (r : self.inflight)
+	{
+		if (r.id == id) return true;
+	}
+	foreach (r : self.pending)
+	{
+		if (r.id == id) return true;
+	}
+	return false;
+}
+
+// Refuses a packet the server could not accept: larger than its Maximum Packet Size.
+fn void? Core.check_outbound_size(&self, Packet* p)
+{
+	if (self.limits.max_packet_size == 0) return;
+	usz size = packet::encoded_size(self.config.version, p)!;
+	if (size > self.limits.max_packet_size) return mqtt::PACKET_TOO_LARGE~;
+}
+
+fn bool has_wildcard(String filter) @private
+{
+	foreach (c : filter)
+	{
+		if (c == '+' || c == '#') return true;
+	}
+	return false;
+}
+
+// Sends a message. Returns the packet id (0 for QoS 0; 0 is never a valid id, [5.0 2.2.1]).
 // publish never touches in_buf, so it may be called while an Event is borrowed.
-// Faults: NOT_CONNECTED, INVALID_TOPIC_NAME,
-// NOT_SUPPORTED_BY_SERVER (QoS/retain above what CONNACK allowed), PACKET_TOO_LARGE,
-// QUEUE_FULL. While the server's Receive Maximum is exhausted QoS>0 messages wait in the queue.
-fn ushort? Core.publish(&self, Duration now, OutMessage* msg) { return mqtt::NOT_CONNECTED~; }
-fn ushort? Core.subscribe(&self, Duration now, SubEntry[] entries, Properties* props) { return mqtt::NOT_CONNECTED~; }
-fn ushort? Core.unsubscribe(&self, Duration now, String[] filters, Properties* props) { return mqtt::NOT_CONNECTED~; }
+// Faults: NOT_CONNECTED, INVALID_TOPIC_NAME, NOT_SUPPORTED_BY_SERVER (QoS or retain above what the
+// CONNACK allowed, a Topic Alias), PACKET_TOO_LARGE (over the server's Maximum Packet Size),
+// INVALID_PROPERTY, QUEUE_FULL. QoS 1 and 2 are sent by the acknowledgement flows.
+fn ushort? Core.publish(&self, Duration now, OutMessage* msg)
+{
+	if (self.state != State.CONNECTED) return mqtt::NOT_CONNECTED~;
+	topic::validate_name(msg.topic)!;
+	if (msg.qos.ordinal > self.limits.maximum_qos.ordinal) return mqtt::NOT_SUPPORTED_BY_SERVER~;
+	if (msg.retain && !self.limits.retain_available) return mqtt::NOT_SUPPORTED_BY_SERVER~;
+	if (msg.props.has(PropId.TOPIC_ALIAS)) return mqtt::NOT_SUPPORTED_BY_SERVER~;
+	if (msg.qos != QoS.AT_MOST_ONCE) return mqtt::INVALID_ARGUMENT~;
+	Duration t = self.tick(now);
+	Packet p = { .type = PacketType.PUBLISH };
+	p.publish = { .qos = msg.qos, .retain = msg.retain, .topic = msg.topic, .payload = msg.payload };
+	if (is_v5(&self.config)) p.publish.props = msg.props;
+	self.check_outbound_size(&p)!;
+	self.queue_packet(t, &p)!;
+	return 0;
+}
+
+// Subscribes to one or more filters; returns the packet id, the SUBSCRIBED event carries one code per filter.
+// Faults: NOT_CONNECTED, INVALID_ARGUMENT (no filters, No Local on a shared filter), INVALID_TOPIC_FILTER,
+// NOT_SUPPORTED_BY_SERVER (wildcard, shared or subscription identifier the server does not offer),
+// PACKET_ID_EXHAUSTED, PACKET_TOO_LARGE, QUEUE_FULL. A new connection does not repeat it.
+fn ushort? Core.subscribe(&self, Duration now, SubEntry[] entries, Properties* props)
+{
+	if (self.state != State.CONNECTED) return mqtt::NOT_CONNECTED~;
+	if (entries.len == 0) return mqtt::INVALID_ARGUMENT~;
+	bool v5 = is_v5(&self.config);
+	foreach (e : entries)
+	{
+		topic::validate_filter(e.filter)!;
+		if (!v5) continue;
+		if (has_wildcard(e.filter) && !self.limits.wildcard_available) return mqtt::NOT_SUPPORTED_BY_SERVER~;
+		if (topic::is_shared(e.filter))
+		{
+			if (!self.limits.shared_available) return mqtt::NOT_SUPPORTED_BY_SERVER~;
+			if (e.no_local) return mqtt::INVALID_ARGUMENT~;       // [5.0 3.8.3.1]
+		}
+	}
+	if (v5 && props != null && (props.subscription_ids.len > 0 || props.has(PropId.SUBSCRIPTION_IDENTIFIER)))
+	{
+		if (!self.limits.subid_available) return mqtt::NOT_SUPPORTED_BY_SERVER~;
+	}
+	Duration t = self.tick(now);
+	ushort id = self.alloc_id()!;
+	Packet p = { .type = PacketType.SUBSCRIBE };
+	p.subscribe = { .packet_id = id, .entries = entries };
+	if (v5 && props != null) p.subscribe.props = *props;
+	self.check_outbound_size(&p)!;
+	self.queue_packet(t, &p)!;
+	self.pending.push({ .id = id, .kind = PendingKind.SUBSCRIBE, .count = entries.len });
+	return id;
+}
+
+// Removes subscriptions; returns the packet id. Faults as subscribe.
+fn ushort? Core.unsubscribe(&self, Duration now, String[] filters, Properties* props)
+{
+	if (self.state != State.CONNECTED) return mqtt::NOT_CONNECTED~;
+	if (filters.len == 0) return mqtt::INVALID_ARGUMENT~;
+	foreach (f : filters) topic::validate_filter(f)!;
+	Duration t = self.tick(now);
+	ushort id = self.alloc_id()!;
+	Packet p = { .type = PacketType.UNSUBSCRIBE };
+	p.unsubscribe = { .packet_id = id, .filters = filters };
+	if (is_v5(&self.config) && props != null) p.unsubscribe.props = *props;
+	self.check_outbound_size(&p)!;
+	self.queue_packet(t, &p)!;
+	self.pending.push({ .id = id, .kind = PendingKind.UNSUBSCRIBE, .count = filters.len });
+	return id;
+}
+
 // Manual AUTH (5.0 3.15): continue or re-authenticate (reason 0x19).
 fn void? Core.send_auth(&self, Duration now, ReasonCode reason, char[] data) { return mqtt::NOT_CONNECTED~; }
 // Counts for monitoring and tests.
