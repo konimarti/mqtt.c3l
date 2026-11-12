@@ -31,6 +31,7 @@ fn int run()
 	Event ev;
 	while (c.next(&ev, time::sec(30))!!)
 	{
+		if (ev.kind == EventKind.CLOSED) break;
 		if (ev.kind == EventKind.MESSAGE) io::printfn("%s: %s", ev.message.topic, (String)ev.message.payload);
 	}
 	return 0;
@@ -39,7 +40,7 @@ fn int run()
 
 Every blocking call takes a timeout (a `Duration`); the reads and writes inside it get what is left of it. A write that fails
 may have left half a packet on the wire, so the client closes the transport and the call returns `TIMEOUT` or `CLOSED`.
-`next` also keeps the connection alive: the keep-alive PINGREQ is written while it waits.
+`next` returns `false` when nothing arrived within the timeout (idle); the connection is closed when it returns a `CLOSED` event. `next` also keeps the connection alive: the keep-alive PINGREQ is written while it waits.
 
 ### Events borrow the core's buffer
 
