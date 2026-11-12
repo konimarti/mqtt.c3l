@@ -1,5 +1,5 @@
 module mqtt::core;
-import mqtt, mqtt::packet, mqtt::props, mqtt::topic;
+import mqtt, mqtt::packet, mqtt::props, mqtt::topic, mqtt::wire;
 import std::core::dstring, std::collections::list, std::time;
 
 // Enhanced authentication hook (5.0 section 4.12). The core never interprets auth data.
@@ -232,6 +232,7 @@ struct Core
 	bool reached_connected;         // the current connection got a CONNACK that accepted it
 	Limits limits;                  // negotiated by CONNACK
 	String assigned_id;             // owned copy of the server assigned client identifier
+	ulong[1024] id_used;            // bit per packet id: held by an inflight record or a pending request
 }
 
 enum InflightState : char { WAIT_PUBACK, WAIT_PUBREC, WAIT_PUBCOMP, QUEUED }
@@ -260,7 +261,8 @@ struct EventRec
 	EventKind kind;
 	usz frame_off;
 	usz frame_len;                  // 0 = no frame
-	ReasonCode reason;              // CLOSED
+	ReasonCode reason;              // CLOSED, PUBLISH_DONE
+	ushort packet_id;               // PUBLISH_DONE
 	fault cause;                    // CLOSED
 	bool by_server;                 // CLOSED
 	bool session_kept;              // CLOSED
@@ -335,6 +337,8 @@ fn void? Core.init(&self, Allocator allocator, Config* config)
 // Frees all owned memory. Held session state (inflight, queue) is lost.
 fn void Core.free(&self)
 {
+	foreach (r : self.inflight) self.free_block(&r);
+	foreach (r : self.queue) self.free_block(&r);
 	self.in_buf.free();
 	self.out_buf.free();
 	self.events.free();
@@ -408,7 +412,7 @@ fn void? Core.connect(&self, Duration now)
 	Duration t = self.tick(now);
 	self.out_buf.clear();
 	self.in_buf.size = self.in_consumed;             // bytes of an earlier connection are void
-	self.pending.clear();
+	self.clear_pending();
 	self.closed_seen = false;
 	self.reached_connected = false;
 	self.ping_outstanding = false;
@@ -549,8 +553,13 @@ fn void? Core.handle_frame(&self, Duration now, usz off, usz n)
 		case PacketType.SUBACK:
 		case PacketType.UNSUBACK:
 			self.handle_suback(now, off, n, p)!;
+		case PacketType.PUBACK:
+		case PacketType.PUBREC:
+		case PacketType.PUBCOMP:
+			self.handle_ack(now, off, n, p)!;
+		case PacketType.PUBREL:
+			self.handle_pubrel(now, p)!;
 		default:
-			// acknowledgements of our own publications are handled by the QoS flows
 			break;
 	}
 }
@@ -598,6 +607,7 @@ fn void? Core.handle_suback(&self, Duration now, usz off, usz n, Packet* p)
 		bool has_codes = kind == PendingKind.SUBSCRIBE || is_v5(&self.config);
 		if (has_codes && a.codes.len != pa.count) return self.fail(now, mqtt::PROTOCOL_ERROR);
 		self.pending.remove_at(i);
+		self.release_id(pa.id);
 		EventKind ek = kind == PendingKind.SUBSCRIBE ? EventKind.SUBSCRIBED : EventKind.UNSUBSCRIBED;
 		self.events.push({ .kind = ek, .frame_off = off, .frame_len = n });
 		return;
@@ -663,7 +673,7 @@ fn void? Core.handle_connack(&self, Duration now, usz off, usz n, Packet* p)
 fn void Core.emit_closed(&self, Duration now, fault cause, ReasonCode reason, bool by_server, usz off, usz n)
 {
 	self.state = State.DISCONNECTED;
-	self.pending.clear();                          // a SUBSCRIBE or UNSUBSCRIBE is not repeated on a new connection
+	self.clear_pending();                          // a SUBSCRIBE or UNSUBSCRIBE is not repeated on a new connection
 	if (self.closed_seen) return;
 	self.closed_seen = true;
 	if (self.reached_connected) self.closed_at = now;
@@ -769,6 +779,13 @@ fn bool Core.poll_event(&self, Event* ev)
 				.packet_id = u.packet_id,
 				.props = u.props,
 			};
+		case EventKind.PUBLISH_DONE:
+			ev.done = { .packet_id = rec.packet_id, .reason = rec.reason };
+			if (rec.frame_len > 0)
+			{
+				Packet p = packet::decode(self.config.version, self.in_buf.entries[rec.frame_off:rec.frame_len])!!;
+				ev.done.props = p.ack.props;
+			}
 		case EventKind.SUBSCRIBED:
 		case EventKind.UNSUBSCRIBED:
 			Packet p = packet::decode(self.config.version, self.in_buf.entries[rec.frame_off:rec.frame_len])!!;
@@ -844,7 +861,7 @@ fn void Core.transport_closed(&self, Duration now)
 		self.emit_closed(t, cause, ReasonCode.UNSPECIFIED_ERROR, false, 0, 0);
 	}
 	self.out_buf.clear();
-	self.pending.clear();
+	self.clear_pending();
 	self.in_buf.size = self.in_consumed;
 	self.ping_outstanding = false;
 }
@@ -867,29 +884,33 @@ fn void? Core.disconnect(&self, Duration now, ReasonCode reason, Properties* pro
 	self.state = State.DISCONNECTING;
 }
 
-// Next free packet id (1..65535, never 0), skipping ids that are in use.
+// Next free packet id (1..65535, never 0), skipping ids that are in use. The id is marked in use.
 fn ushort? Core.alloc_id(&self)
 {
 	for (int tries = 0; tries < 65_535; tries++)
 	{
 		ushort id = self.next_id == 0 ? 1 : self.next_id;
 		self.next_id = id == 65_535 ? 1 : (ushort)(id + 1);
-		if (!self.id_in_use(id)) return id;
+		if (!self.id_in_use(id))
+		{
+			self.id_used[id / 64] |= 1UL << (id % 64);
+			return id;
+		}
 	}
 	return mqtt::PACKET_ID_EXHAUSTED~;
 }
 
-fn bool Core.id_in_use(&self, ushort id)
+fn bool Core.id_in_use(&self, ushort id) => self.id_used[id / 64] & (1UL << (id % 64)) != 0;
+
+fn void Core.release_id(&self, ushort id)
 {
-	foreach (r : self.inflight)
-	{
-		if (r.id == id) return true;
-	}
-	foreach (r : self.pending)
-	{
-		if (r.id == id) return true;
-	}
-	return false;
+	self.id_used[id / 64] &= ~(1UL << (id % 64));
+}
+
+fn void Core.clear_pending(&self)
+{
+	foreach (r : self.pending) self.release_id(r.id);
+	self.pending.clear();
 }
 
 // Refuses a packet the server could not accept: larger than its Maximum Packet Size.
@@ -898,6 +919,12 @@ fn void? Core.check_outbound_size(&self, Packet* p)
 	if (self.limits.max_packet_size == 0) return;
 	usz size = packet::encoded_size(self.config.version, p)!;
 	if (size > self.limits.max_packet_size) return mqtt::PACKET_TOO_LARGE~;
+}
+
+fn void? Core.send_request(&self, Duration now, Packet* p)
+{
+	self.check_outbound_size(p)!;
+	self.queue_packet(now, p)!;
 }
 
 fn bool has_wildcard(String filter) @private
@@ -913,7 +940,9 @@ fn bool has_wildcard(String filter) @private
 // publish never touches in_buf, so it may be called while an Event is borrowed.
 // Faults: NOT_CONNECTED, INVALID_TOPIC_NAME, NOT_SUPPORTED_BY_SERVER (QoS or retain above what the
 // CONNACK allowed, a Topic Alias), PACKET_TOO_LARGE (over the server's Maximum Packet Size),
-// INVALID_PROPERTY, QUEUE_FULL. QoS 1 and 2 are sent by the acknowledgement flows.
+// INVALID_PROPERTY, QUEUE_FULL. A QoS 1 or 2 message gets a packet id when it is sent; if the send window of
+// the server (Receive Maximum, 3.1.1: max_inflight) is full it waits in a FIFO queue and 0 is returned, and the
+// PUBLISH_DONE event carries the id it was sent with.
 fn ushort? Core.publish(&self, Duration now, OutMessage* msg)
 {
 	if (self.state != State.CONNECTED) return mqtt::NOT_CONNECTED~;
@@ -921,8 +950,8 @@ fn ushort? Core.publish(&self, Duration now, OutMessage* msg)
 	if (msg.qos.ordinal > self.limits.maximum_qos.ordinal) return mqtt::NOT_SUPPORTED_BY_SERVER~;
 	if (msg.retain && !self.limits.retain_available) return mqtt::NOT_SUPPORTED_BY_SERVER~;
 	if (msg.props.has(PropId.TOPIC_ALIAS)) return mqtt::NOT_SUPPORTED_BY_SERVER~;
-	if (msg.qos != QoS.AT_MOST_ONCE) return mqtt::INVALID_ARGUMENT~;
 	Duration t = self.tick(now);
+	if (msg.qos != QoS.AT_MOST_ONCE) return self.publish_acknowledged(t, msg);
 	Packet p = { .type = PacketType.PUBLISH };
 	p.publish = { .qos = msg.qos, .retain = msg.retain, .topic = msg.topic, .payload = msg.payload };
 	if (is_v5(&self.config)) p.publish.props = msg.props;
@@ -960,8 +989,11 @@ fn ushort? Core.subscribe(&self, Duration now, SubEntry[] entries, Properties* p
 	Packet p = { .type = PacketType.SUBSCRIBE };
 	p.subscribe = { .packet_id = id, .entries = entries };
 	if (v5 && props != null) p.subscribe.props = *props;
-	self.check_outbound_size(&p)!;
-	self.queue_packet(t, &p)!;
+	if (catch err = self.send_request(t, &p))
+	{
+		self.release_id(id);
+		return err~;
+	}
 	self.pending.push({ .id = id, .kind = PendingKind.SUBSCRIBE, .count = entries.len });
 	return id;
 }
@@ -977,10 +1009,247 @@ fn ushort? Core.unsubscribe(&self, Duration now, String[] filters, Properties* p
 	Packet p = { .type = PacketType.UNSUBSCRIBE };
 	p.unsubscribe = { .packet_id = id, .filters = filters };
 	if (is_v5(&self.config) && props != null) p.unsubscribe.props = *props;
-	self.check_outbound_size(&p)!;
-	self.queue_packet(t, &p)!;
+	if (catch err = self.send_request(t, &p))
+	{
+		self.release_id(id);
+		return err~;
+	}
 	self.pending.push({ .id = id, .kind = PendingKind.UNSUBSCRIBE, .count = filters.len });
 	return id;
+}
+
+// ---- QoS 1 and 2: messages we send ----
+
+fn void Core.free_block(&self, Inflight* r)
+{
+	if (r.block.len > 0) alloc::free(self.allocator, r.block.ptr);
+	r.block = {};
+}
+
+// Index of the inflight record with this packet id, -1 if none.
+fn sz Core.find_inflight(&self, ushort id)
+{
+	for (sz i = 0; i < self.inflight.len(); i++)
+	{
+		if (self.inflight.entries[i].id == id) return i;
+	}
+	return -1;
+}
+
+// Copies topic, payload and (5.0) properties of a message into one block that lives until the flow ends.
+fn Inflight? Core.make_record(&self, Duration now, OutMessage* msg)
+{
+	bool v5 = is_v5(&self.config);
+	usz tl = msg.topic.len;
+	usz pl = msg.payload.len;
+	usz props_len = v5 ? props::properties_size(&msg.props, PropContext.PUBLISH)! : 0;
+	char[] block = alloc::alloc_array(self.allocator, char, (sz)(tl + pl + props_len));
+	block[:tl] = ((char[])msg.topic)[..];
+	if (pl > 0) block[tl:pl] = msg.payload[..];
+	Inflight r = {
+		.qos = msg.qos,
+		.retain = msg.retain,
+		.queued_at = now,
+		.block = block,
+		.topic_len = tl,
+		.payload_len = pl,
+	};
+	if (v5)
+	{
+		ByteWriter w = wire::writer(block[tl + pl..]);
+		if (catch err = w.properties(&msg.props, PropContext.PUBLISH))
+		{
+			self.free_block(&r);
+			return err~;
+		}
+		if (msg.props.has(PropId.MESSAGE_EXPIRY_INTERVAL)) r.expiry_s = msg.props.message_expiry;
+	}
+	return r;
+}
+
+// Seconds of the Message Expiry Interval left (0: used up). Rounded up, so a message is never
+// sent with an interval longer than it has left.
+fn uint Core.remaining_expiry(&self, Duration now, Inflight* r)
+{
+	long total = (long)r.expiry_s * 1000;
+	long elapsed = (now - r.queued_at).to_ms();
+	if (elapsed >= total) return 0;
+	return (uint)((total - elapsed + 999) / 1000);
+}
+
+// (Re)sends the PUBLISH of a record: the Message Expiry Interval, if there is one, becomes the time left.
+fn void? Core.send_record(&self, Duration now, Inflight* r, bool dup)
+{
+	Packet p = { .type = PacketType.PUBLISH };
+	Publish* u = &p.publish;
+	u.qos = r.qos;
+	u.retain = r.retain;
+	u.dup = dup;
+	u.packet_id = r.id;
+	u.topic = (String)r.block[:r.topic_len];
+	u.payload = r.block[r.topic_len:r.payload_len];
+	if (is_v5(&self.config))
+	{
+		ByteReader rd = wire::reader(r.block[r.topic_len + r.payload_len..]);
+		u.props = rd.properties(PropContext.PUBLISH)!;
+		if (r.expiry_s != 0) u.props.message_expiry = self.remaining_expiry(now, r);
+	}
+	self.queue_packet(now, &p)!;
+}
+
+// QoS 1 and 2 publish: sent at once if the server's window has room, else queued (FIFO).
+fn ushort? Core.publish_acknowledged(&self, Duration now, OutMessage* msg)
+{
+	Packet probe = { .type = PacketType.PUBLISH };
+	probe.publish = { .qos = msg.qos, .topic = msg.topic, .payload = msg.payload, .packet_id = 1 };
+	if (is_v5(&self.config)) probe.publish.props = msg.props;
+	packet::encoded_size(self.config.version, &probe)!;           // refuses what could never be sent
+	self.check_outbound_size(&probe)!;
+	Inflight r = self.make_record(now, msg)!;
+	if (self.queue.len() > 0 || self.inflight.len() >= (sz)self.limits.send_quota)
+	{
+		if ((usz)self.queue.len() >= self.config.effective_max_queued())
+		{
+			self.free_block(&r);
+			return mqtt::QUEUE_FULL~;
+		}
+		r.state = InflightState.QUEUED;
+		self.queue.push(r);
+		return 0;
+	}
+	ushort? id = self.alloc_id();
+	if (catch err = id)
+	{
+		self.free_block(&r);
+		return err~;
+	}
+	r.id = id;
+	r.state = msg.qos == QoS.AT_LEAST_ONCE ? InflightState.WAIT_PUBACK : InflightState.WAIT_PUBREC;
+	if (catch err = self.send_record(now, &r, false))
+	{
+		self.release_id(id);
+		self.free_block(&r);
+		return err~;
+	}
+	self.inflight.push(r);
+	return id;
+}
+
+// Sends queued messages while the window has room; a message whose expiry ran out while it waited is dropped.
+fn void? Core.drain_queue(&self, Duration now)
+{
+	while (self.queue.len() > 0 && self.inflight.len() < (sz)self.limits.send_quota)
+	{
+		Inflight r = self.queue.entries[0];
+		if (r.expiry_s != 0 && self.remaining_expiry(now, &r) == 0)
+		{
+			self.queue.remove_first()!!;
+			self.free_block(&r);
+			self.events.push({ .kind = EventKind.PUBLISH_DONE, .reason = ReasonCode.UNSPECIFIED_ERROR });
+			continue;
+		}
+		ushort? id = self.alloc_id();
+		if (catch err = id) break;                        // all ids in use: it stays queued
+		r.id = id;
+		r.state = r.qos == QoS.AT_LEAST_ONCE ? InflightState.WAIT_PUBACK : InflightState.WAIT_PUBREC;
+		if (catch err = self.send_record(now, &r, false))
+		{
+			self.release_id(id);
+			return err~;
+		}
+		self.queue.remove_first()!!;
+		self.inflight.push(r);
+	}
+}
+
+// The flow of record idx is over: free it, report PUBLISH_DONE, let the next queued message go.
+fn void? Core.finish_record(&self, Duration now, sz idx, ReasonCode reason, usz off, usz n)
+{
+	Inflight r = self.inflight.entries[idx];
+	self.inflight.remove_at(idx);
+	self.free_block(&r);
+	self.release_id(r.id);
+	self.events.push({ .kind = EventKind.PUBLISH_DONE, .reason = reason, .packet_id = r.id, .frame_off = off, .frame_len = n });
+	if (catch err = self.drain_queue(now)) return self.fail(now, err);
+}
+
+fn void? Core.send_or_fail(&self, Duration now, Packet* p)
+{
+	if (catch err = self.queue_packet(now, p)) return self.fail(now, err);
+}
+
+fn void? Core.send_pubrel(&self, Duration now, ushort id, char reason)
+{
+	Packet p = { .type = PacketType.PUBREL };
+	p.ack.packet_id = id;
+	p.ack.reason = reason;
+	self.send_or_fail(now, &p)!;
+}
+
+// PUBACK, PUBREC, PUBCOMP for the messages we sent. An acknowledgement for an id we do not know is
+// ignored, except PUBREC, which is answered with PUBREL (5.0: reason 0x92 "Packet Identifier not found"
+// [5.0 3.6.2.1]) so that the server can finish its side. An acknowledgement of the wrong kind for a known
+// id is a protocol violation.
+fn void? Core.handle_ack(&self, Duration now, usz off, usz n, Packet* p)
+{
+	Ack* a = &p.ack;
+	sz idx = self.find_inflight(a.packet_id);
+	ReasonCode reason = (ReasonCode)a.reason;
+	switch (p.type)
+	{
+		case PacketType.PUBACK:
+			if (idx < 0) return;
+			if (self.inflight.entries[idx].state != InflightState.WAIT_PUBACK) return self.fail(now, mqtt::PROTOCOL_ERROR);
+			self.finish_record(now, idx, reason, off, n)!;
+		case PacketType.PUBREC:
+			if (idx < 0)
+			{
+				self.send_pubrel(now, a.packet_id, is_v5(&self.config) ? (char)ReasonCode.PACKET_IDENTIFIER_NOT_FOUND : 0)!;
+				return;
+			}
+			Inflight* r = &self.inflight.entries[idx];
+			switch (r.state)
+			{
+				case InflightState.WAIT_PUBREC:
+					if (a.reason >= 0x80)
+					{
+						self.finish_record(now, idx, reason, off, n)!;      // refused: the flow ends here
+					}
+					else
+					{
+						r.state = InflightState.WAIT_PUBCOMP;
+						self.send_pubrel(now, a.packet_id, 0)!;
+					}
+				case InflightState.WAIT_PUBCOMP:
+					self.send_pubrel(now, a.packet_id, 0)!;               // the PUBREC again: answer again
+				default:
+					return self.fail(now, mqtt::PROTOCOL_ERROR);
+			}
+		default:
+			// PUBCOMP
+			if (idx < 0) return;
+			if (self.inflight.entries[idx].state != InflightState.WAIT_PUBCOMP) return self.fail(now, mqtt::PROTOCOL_ERROR);
+			self.finish_record(now, idx, reason, off, n)!;
+	}
+}
+
+// PUBREL from the server completes an inbound QoS 2 message: forget the id, answer PUBCOMP. An id
+// that is not known gets the PUBCOMP too (5.0: reason 0x92), so that the server can finish its side.
+fn void? Core.handle_pubrel(&self, Duration now, Packet* p)
+{
+	ushort id = p.ack.packet_id;
+	bool known;
+	for (sz i = 0; i < self.in_qos2.len(); i++)
+	{
+		if (self.in_qos2.entries[i] != id) continue;
+		self.in_qos2.remove_at(i);
+		known = true;
+		break;
+	}
+	Packet c = { .type = PacketType.PUBCOMP };
+	c.ack.packet_id = id;
+	if (!known && is_v5(&self.config)) c.ack.reason = (char)ReasonCode.PACKET_IDENTIFIER_NOT_FOUND;
+	self.send_or_fail(now, &c)!;
 }
 
 // Manual AUTH (5.0 3.15): continue or re-authenticate (reason 0x19).
