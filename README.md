@@ -71,3 +71,18 @@ finished are sent again); `open` starts a new one.
 - Messages of QoS 1 and 2 that were not finished are kept across reconnects and sent again (5.0: while the session lives);
   without a stored session they are reported with `PUBLISH_DONE` and an error reason.
 - Large retained messages need a bigger `max_packet_size` in the `Config` (default 256 KiB).
+
+## mqttc
+
+A small command line client over the library (`c3c build mqttc`, binary in `build/`).
+
+```sh
+build/mqttc pub -h localhost -t plant/line1/temp -m 21.5 -q 1
+build/mqttc sub -h localhost -t 'plant/#' -q 1 -c 10
+```
+
+`--v311` selects MQTT 3.1.1 (5.0 is the default), `--follow-redirect` follows a server redirect (at most 3 hops), `-v` reports
+progress on stderr. The client id is `mqttc-<random>` unless `-i` is given. The password is read from `--password-file FILE`
+or the environment variable `MQTT_PASSWORD`; `-P` works but warns, because the command line is visible to other users. It is
+never printed. A retained message with an empty payload deletes the retained message and is refused unless
+`--allow-clear-retained` is given. `build/mqttc` without arguments prints the usage.
