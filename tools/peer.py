@@ -33,12 +33,25 @@ def paho_config(port, limits):
     return "\n".join(lines) + "\n"
 
 
+# mosquitto 2.x names for the same limits; untested until a mosquitto is installed (CI installs it)
+MOSQUITTO_NAMES = {"receive_maximum": "max_inflight_messages", "maximum_packet_size": "max_packet_size",
+                   "topic_alias_maximum": "max_topic_alias", "maximum_qos": "max_qos", "retain_available": "retain_available"}
+
+
+def mosquitto_config(port, limits):
+    lines = ["listener %d 127.0.0.1" % port, "allow_anonymous true", "persistence false"]
+    lines += ["%s %s" % (MOSQUITTO_NAMES[k], v) for k, v in limits.items()]
+    return "\n".join(lines) + "\n"
+
+
 def broker_command(kind, config_path, port):
     env_cmd = os.environ.get("MQTT_PEER_CMD")
     if env_cmd:
         return shlex.split(env_cmd.format(config=config_path, port=port)), None
     if kind == "paho":
         return [sys.executable, "startbroker.py", "-c", config_path], PAHO_DIR
+    if kind == "mosquitto":
+        return ["mosquitto", "-c", config_path], None
     sys.exit("peer.py: no broker command for kind %r (set MQTT_PEER_CMD)" % kind)
 
 
@@ -60,10 +73,14 @@ def run_group(args, group):
     with tempfile.TemporaryDirectory(prefix="mqtt-peer-") as tmp:
         config_path = os.path.join(tmp, "broker.conf")
         with open(config_path, "w") as f:
-            f.write(paho_config(port, GROUPS[group]))
+            f.write((mosquitto_config if args.kind == "mosquitto" else paho_config)(port, GROUPS[group]))
         cmd, cwd = broker_command(args.kind, config_path, port)
         log = open(os.path.join(tmp, "broker.log"), "w")
-        proc = subprocess.Popen(cmd, cwd=cwd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            proc = subprocess.Popen(cmd, cwd=cwd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        except OSError as e:
+            print("FAIL %s-broker cannot start %s: %s" % (group, cmd[0], e))
+            return 1, 0
         try:
             if not wait_for_port(port, proc):
                 print("FAIL %s-broker the broker did not start; see below" % group)
