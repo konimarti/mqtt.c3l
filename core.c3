@@ -236,6 +236,7 @@ struct Core
 	bool reached_connected;         // the current connection got a CONNACK that accepted it
 	Limits limits;                  // negotiated by CONNACK
 	String assigned_id;             // owned copy of the server assigned client identifier
+	bool auth_active;               // an authentication exchange is running: the CONNECT's, or a re-authentication
 	sz resend_waiting;              // inflight records kept from an earlier connection that were not sent again yet
 	bool flow_stalled;              // resending or sending queued messages stopped: the output buffer is full
 	ulong[1024] id_used;            // bit per packet id: held by an inflight record or a pending request
@@ -477,6 +478,7 @@ fn void? Core.connect(&self, Duration now)
 	self.clear_pending();
 	self.apply_session_rules(t);
 	self.flow_stalled = false;
+	self.auth_active = is_v5(&self.config) && self.config.auth_method.len > 0;       // the exchange of the CONNECT
 	self.reset_aliases();
 	self.closed_seen = false;
 	self.reached_connected = false;
@@ -769,6 +771,7 @@ fn void? Core.handle_connack(&self, Duration now, usz off, usz n, Packet* p)
 		l.shared_available = true;
 	}
 	self.limits = l;
+	self.auth_active = false;
 	self.state = State.CONNECTED;
 	self.reached_connected = true;
 	self.ping_outstanding = false;
@@ -780,6 +783,7 @@ fn void? Core.handle_connack(&self, Duration now, usz off, usz n, Packet* p)
 fn void Core.emit_closed(&self, Duration now, fault cause, ReasonCode reason, bool by_server, usz off, usz n)
 {
 	self.state = State.DISCONNECTED;
+	self.auth_active = false;
 	self.clear_pending();                          // a SUBSCRIBE or UNSUBSCRIBE is not repeated on a new connection
 	if (self.closed_seen) return;
 	self.closed_seen = true;
@@ -1168,10 +1172,12 @@ fn void? Core.handle_auth(&self, Duration now, usz off, usz n, Packet* p)
 	Config* c = &self.config;
 	if (c.auth_method.len == 0) return self.fail(now, mqtt::PROTOCOL_ERROR);       // we never asked for enhanced authentication
 	if (!a.props.has(PropId.AUTHENTICATION_METHOD) || a.props.auth_method != c.auth_method) return self.fail(now, mqtt::PROTOCOL_ERROR);
+	if (!self.auth_active) return self.fail(now, mqtt::PROTOCOL_ERROR);            // the server only answers what the client started
 	if (a.reason == (char)ReasonCode.SUCCESS)
 	{
 		// the end of a re-authentication; while connecting the CONNACK ends the exchange
 		if (self.state != State.CONNECTED) return self.fail(now, mqtt::PROTOCOL_ERROR);
+		self.auth_active = false;
 		self.events.push({ .kind = EventKind.AUTH, .frame_off = off, .frame_len = n });
 		return;
 	}
@@ -1210,17 +1216,33 @@ fn void? Core.queue_auth(&self, Duration now, ReasonCode reason, char[] data)
 	self.queue_packet(now, &p)!;
 }
 
-// Sends an AUTH packet: the answer to a challenge (CONTINUE_AUTHENTICATION, while connecting or connected) or
-// the start of a re-authentication (RE_AUTHENTICATE, connected). Needs a 5.0 Config with an auth_method.
+// Sends an AUTH packet: the answer to a challenge of an exchange that is running (CONTINUE_AUTHENTICATION, while
+// connecting or connected) or the start of a re-authentication (RE_AUTHENTICATE, connected, one at a time; with a
+// hook and empty data the data comes from hook.initial). Needs a 5.0 Config with an auth_method.
 // Faults: INVALID_ARGUMENT, NOT_CONNECTED.
 fn void? Core.send_auth(&self, Duration now, ReasonCode reason, char[] data)
 {
 	if (!is_v5(&self.config) || self.config.auth_method.len == 0) return mqtt::INVALID_ARGUMENT~;
 	if (self.state != State.CONNECTING && self.state != State.CONNECTED) return mqtt::NOT_CONNECTED~;
-	bool ok = reason == ReasonCode.CONTINUE_AUTHENTICATION || (reason == ReasonCode.RE_AUTHENTICATE && self.state == State.CONNECTED);
-	if (!ok) return mqtt::INVALID_ARGUMENT~;
 	Duration t = self.tick(now);
-	self.queue_auth(t, reason, data)!;
+	if (reason == ReasonCode.CONTINUE_AUTHENTICATION)
+	{
+		if (!self.auth_active) return mqtt::INVALID_ARGUMENT~;                      // there is nothing to continue
+		self.queue_auth(t, reason, data)!;
+		return;
+	}
+	if (reason != ReasonCode.RE_AUTHENTICATE || self.state != State.CONNECTED || self.auth_active) return mqtt::INVALID_ARGUMENT~;
+	// with a hook and no data of the caller the hook starts the exchange, as it does for the CONNECT
+	DString first = dstring::new(self.allocator);
+	defer first.free();
+	char[] payload = data;
+	if (self.config.has_auth_hook && data.len == 0)
+	{
+		if (catch err = self.config.auth_hook.initial(&first)) return mqtt::AUTH_FAILED~;
+		payload = (char[])first.str_view();
+	}
+	self.queue_auth(t, reason, payload)!;
+	self.auth_active = true;
 }
 
 // ---- topic aliases ----

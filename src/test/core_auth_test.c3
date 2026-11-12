@@ -15,6 +15,7 @@ struct FakeAuth (AuthHook)
 fn void? FakeAuth.initial(&self, DString* out) @dynamic
 {
 	if (self.initial_fails) return mqtt::AUTH_FAILED~;
+	self.round = 0;                                  // every exchange starts afresh
 	out.append("init");
 }
 
@@ -184,7 +185,7 @@ fn void auth_reauth_0x19() @test
 	d.has_auth_hook = true;
 	t.open(&d, CONNACK_5);
 	t.core.send_auth(t.clock.now, ReasonCode.RE_AUTHENTICATE, {})!!;
-	harness::expect_out(&t.core, "F0 06 19 04 15 00 01 6D");
+	harness::expect_out(&t.core, "F0 0D 19 0B 15 00 01 6D 16 00 04 69 6E 69 74");           // the hook's first data
 	harness::feed(&t.core, &t.clock, "F0 0B 18 09 15 00 01 6D 16 00 02 63 31");
 	harness::expect_out(&t.core, "F0 0B 18 09 15 00 01 6D 16 00 02 72 31");
 	t.close();
@@ -350,4 +351,99 @@ fn void connack_with_an_unasked_authentication_method() @test
 	harness::feed(&v.core, &v.clock, CONNACK_5);
 	assert(v.take().kind == EventKind.CONNECTED);
 	v.close();
+}
+
+// ---- AUTH only inside an exchange ----
+
+fn void unsolicited_auth_is_a_protocol_error() @test
+{
+	// a success AUTH although no (re-)authentication was started
+	Session s;
+	Config c = cfg();
+	s.open(&c, CONNACK_5);
+	char[] success = testutil::hex("F0 06 00 04 15 00 01 6D");
+	assert(@catch(s.core.input(s.clock.now, success)) == mqtt::PROTOCOL_ERROR);
+	harness::expect_out(&s.core, "E0 01 82");
+	s.close();
+	// a challenge nobody provoked does not drive the hook
+	Session t;
+	FakeAuth fake;
+	Config d = cfg();
+	d.auth_hook = &fake;
+	d.has_auth_hook = true;
+	t.open(&d, CONNACK_5);
+	char[] challenge = testutil::hex("F0 0B 18 09 15 00 01 6D 16 00 02 63 31");
+	assert(@catch(t.core.input(t.clock.now, challenge)) == mqtt::PROTOCOL_ERROR);
+	assert(fake.round == 0, "the hook was not called");
+	t.close();
+	// the application cannot continue an exchange that is not there, nor start two
+	Session u;
+	Config e = cfg();
+	u.open(&e, CONNACK_5);
+	assert(@catch(u.core.send_auth(u.clock.now, ReasonCode.CONTINUE_AUTHENTICATION, testutil::hex("72"))) == mqtt::INVALID_ARGUMENT);
+	assert(u.core.pending_output().len == 0);
+	u.core.send_auth(u.clock.now, ReasonCode.RE_AUTHENTICATE, testutil::hex("78"))!!;
+	u.core.output_done(u.core.pending_output().len);
+	assert(@catch(u.core.send_auth(u.clock.now, ReasonCode.RE_AUTHENTICATE, testutil::hex("78"))) == mqtt::INVALID_ARGUMENT, "one at a time");
+	// the exchange ends with the server's success, and a new one may start
+	harness::feed(&u.core, &u.clock, "F0 06 00 04 15 00 01 6D");
+	assert(u.take().kind == EventKind.AUTH);
+	u.core.send_auth(u.clock.now, ReasonCode.RE_AUTHENTICATE, testutil::hex("78"))!!;
+	u.core.output_done(u.core.pending_output().len);
+	u.close();
+}
+
+fn void auth_exchange_state_during_connect() @test
+{
+	// while connecting the challenges are expected; after the CONNACK they are not
+	Session s;
+	Config c = cfg();
+	s.mem_track.init(mem);
+	s.core.init(&s.mem_track, &c)!!;
+	s.core.connect(s.clock.now)!!;
+	s.core.output_done(s.core.pending_output().len);
+	harness::feed(&s.core, &s.clock, "F0 0B 18 09 15 00 01 6D 16 00 02 63 31");
+	assert(s.take().kind == EventKind.AUTH);
+	harness::feed(&s.core, &s.clock, CONNACK_5);
+	assert(s.take().kind == EventKind.CONNECTED);
+	char[] late = testutil::hex("F0 0B 18 09 15 00 01 6D 16 00 02 63 31");
+	assert(@catch(s.core.input(s.clock.now, late)) == mqtt::PROTOCOL_ERROR);
+	s.close();
+	// a success AUTH while connecting, and re-authentication while connecting
+	Session t;
+	t.mem_track.init(mem);
+	t.core.init(&t.mem_track, &c)!!;
+	t.core.connect(t.clock.now)!!;
+	t.core.output_done(t.core.pending_output().len);
+	assert(@catch(t.core.send_auth(t.clock.now, ReasonCode.RE_AUTHENTICATE, {})) == mqtt::INVALID_ARGUMENT);
+	char[] ok = testutil::hex("F0 06 00 04 15 00 01 6D");
+	assert(@catch(t.core.input(t.clock.now, ok)) == mqtt::PROTOCOL_ERROR);
+	t.close();
+}
+
+fn void reauth_with_a_hook_starts_it_afresh() @test
+{
+	Session s;
+	FakeAuth fake;
+	Config c = cfg();
+	c.auth_hook = &fake;
+	c.has_auth_hook = true;
+	s.mem_track.init(mem);
+	s.core.init(&s.mem_track, &c)!!;
+	s.core.connect(s.clock.now)!!;
+	s.core.output_done(s.core.pending_output().len);
+	harness::feed(&s.core, &s.clock, "F0 0B 18 09 15 00 01 6D 16 00 02 63 31");
+	harness::expect_out(&s.core, "F0 0B 18 09 15 00 01 6D 16 00 02 72 31");
+	harness::feed(&s.core, &s.clock, "F0 0B 18 09 15 00 01 6D 16 00 02 63 32");
+	harness::expect_out(&s.core, "F0 0B 18 09 15 00 01 6D 16 00 02 72 32");
+	harness::feed(&s.core, &s.clock, CONNACK_5);
+	harness::drain(&s.core);
+	assert(fake.round == 2);
+	// a re-authentication asks the hook for its first data, which resets it: the first answer is round 1 again
+	s.core.send_auth(s.clock.now, ReasonCode.RE_AUTHENTICATE, {})!!;
+	assert(fake.round == 0);
+	s.core.output_done(s.core.pending_output().len);
+	harness::feed(&s.core, &s.clock, "F0 0B 18 09 15 00 01 6D 16 00 02 63 31");
+	harness::expect_out(&s.core, "F0 0B 18 09 15 00 01 6D 16 00 02 72 31");
+	s.close();
 }
