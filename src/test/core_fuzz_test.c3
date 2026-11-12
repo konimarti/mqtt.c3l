@@ -1,6 +1,6 @@
 module mqtt::core_fuzz_test;
 import mqtt, mqtt::core, mqtt::harness, mqtt::packet, mqtt::wire, mqtt::testutil;
-import std::core::mem::allocators, std::core::env, std::collections::list, std::io, std::time;
+import std::core::mem::allocators, std::core::dstring, std::core::env, std::collections::list, std::io, std::time;
 
 // Robustness of the codec and the session core: deterministic mutation of every valid vector and of
 // scripted server streams, the robustness expectations of TEST-VECTORS section 11, and no crash,
@@ -172,9 +172,9 @@ fn Config cfg(Version v)
 
 // An accepted session with a SUBSCRIBE (id 3), a QoS 1 (id 1) and a QoS 2 (id 2) PUBLISH in flight, and the
 // output taken as written.
-fn void open_with_flows(Session* s, Config* c)
+fn void open_with_flows(Session* s, Config* c, String connack5 = CONNACK_5)
 {
-	s.open(c, c.version == Version.V5 ? CONNACK_5 : CONNACK_311);
+	s.open(c, c.version == Version.V5 ? connack5 : CONNACK_311);
 	OutMessage a = { .topic = "t", .payload = { 'x' }, .qos = QoS.AT_LEAST_ONCE };
 	OutMessage b = { .topic = "t", .payload = { 'y' }, .qos = QoS.EXACTLY_ONCE };
 	assert(s.core.publish(s.clock.now, &a)!! == 1);
@@ -259,6 +259,47 @@ fn Outcome run_case(Version v, char[] data, usz chunk)
 	Session s;
 	Config c = cfg(v);
 	open_with_flows(&s, &c);
+	Outcome o = run_feed(&s, data, chunk);
+	s.close();
+	return o;
+}
+
+// An authentication method that answers every challenge with one byte.
+struct FuzzAuth (AuthHook)
+{
+	int round;
+}
+
+fn void? FuzzAuth.initial(&self, DString* out) @dynamic
+{
+	self.round = 0;
+	out.append("i");
+}
+
+fn AuthAction? FuzzAuth.step(&self, char[] server_data, DString* out) @dynamic
+{
+	self.round++;
+	if (self.round % 5 == 0) return AuthAction.FAIL;
+	if (self.round % 3 == 0) return AuthAction.DONE;
+	out.append((char)('a' + self.round % 20));
+	return AuthAction.CONTINUE;
+}
+
+// As run_case, with enhanced authentication (a hook, a re-authentication under way), topic aliases in both
+// directions and automatic aliases switched on: the code the plain configuration never reaches.
+fn Outcome run_case_rich(char[] data, usz chunk)
+{
+	Session s;
+	FuzzAuth hook;
+	Config c = cfg(Version.V5);
+	c.auth_method = "a";
+	c.auth_hook = &hook;
+	c.has_auth_hook = true;
+	c.topic_alias_maximum = 10;
+	c.auto_topic_alias = true;
+	open_with_flows(&s, &c, "20 06 00 00 03 22 00 0A");           // the server takes 10 aliases
+	s.core.send_auth(s.clock.now, ReasonCode.RE_AUTHENTICATE, {})!!;
+	s.core.output_done(s.core.pending_output().len);
 	Outcome o = run_feed(&s, data, chunk);
 	s.close();
 	return o;
@@ -353,6 +394,71 @@ fn void mutated_vectors() @test
 	};
 	io::printfn("core_fuzz_test: %d mutated inputs (%d ended the connection, %d events)", cases, faulted, events);
 	assert(cases >= MIN_MUTATED, "at least 20000 mutated inputs");
+}
+
+// The 5.0 vectors and some that only mean something with authentication and aliases switched on: a challenge
+// with data, the end of a re-authentication, an alias bound, used alone and used in a QoS 1 message.
+fn Vec[] rich_corpus()
+{
+	String[*] extra = {
+		"F0 0B 18 09 15 00 01 61 16 00 02 63 31",
+		"F0 06 00 04 15 00 01 61",
+		"30 09 00 03 61 2F 62 03 23 00 01",
+		"30 06 00 00 03 23 00 01",
+		"32 08 00 00 00 05 03 23 00 01",
+		"30 09 00 03 63 2F 64 03 23 00 02",
+	};
+	Vec[] out = mem::temp_array(Vec, (sz)(V5_HEX.len + extra.len));
+	usz n;
+	foreach (h : V5_HEX) out[n++] = { Version.V5, testutil::hex(h), false };
+	foreach (h : extra) out[n++] = { Version.V5, testutil::hex(h), false };
+	return out[:n];
+}
+
+fn void mutated_vectors_with_authentication_and_aliases() @test
+{
+	Rng rng = { 0x7F4A7C159E3779B9 };
+	usz cases;
+	usz faulted;
+	@pool()
+	{
+		Vec[] all = rich_corpus();
+		foreach (v : all)
+		{
+			for (usz i = 0; i < 300; i++)
+			{
+				@pool()
+				{
+					char[] data = mutate(&rng, v.bytes, all);
+					usz chunk = rng.below(3) == 0 ? 1 + rng.below(7) : 0;
+					Outcome o = run_case_rich(data, chunk);
+					assert(!o.failed || is_lib_fault(o.err));
+					// whole and byte by byte give the same result
+					Outcome b = run_case_rich(data, 1);
+					assert(same_outcome(&o, &b), "byte by byte equals whole");
+					cases++;
+					if (o.failed) faulted++;
+				};
+			}
+		}
+	};
+	io::printfn("core_fuzz_test: %d mutated inputs with authentication and aliases (%d ended the connection)", cases, faulted);
+	assert(cases >= 10_000);
+}
+
+fn void rich_vectors_unmutated() @test
+{
+	// every vector of the rich corpus, whole and byte by byte, ends the same way
+	@pool()
+	{
+		foreach (v : rich_corpus())
+		{
+			Outcome a = run_case_rich(v.bytes, 0);
+			Outcome b = run_case_rich(v.bytes, 1);
+			assert(same_outcome(&a, &b), "byte by byte equals whole");
+			assert(!a.failed || is_lib_fault(a.err));
+		}
+	};
 }
 
 // The scripts are valid streams: unmutated they are accepted (the 5.0 one ends with a server DISCONNECT).
