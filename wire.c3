@@ -62,11 +62,23 @@ fn uint? vbi_decode(char[] input, usz* consumed)
 fn void? validate_utf8(String s)
 {
 	if (s.len > mqtt::MAX_STRING_LENGTH) return mqtt::INVALID_UTF8~;
+	return check_utf8(s, false);
+}
+
+// Well-formed UTF-8 of any length, for message payloads that announce themselves as text
+// (Payload Format Indicator 1). U+0000 is accepted: only a UTF-8 Encoded String forbids it.
+fn void? validate_utf8_text(String s)
+{
+	return check_utf8(s, true);
+}
+
+fn void? check_utf8(String s, bool allow_nul) @private
+{
 	usz i = 0;
 	while (i < s.len)
 	{
 		char c = s[i];
-		if (c == 0) return mqtt::INVALID_UTF8~;
+		if (c == 0 && !allow_nul) return mqtt::INVALID_UTF8~;
 		if (c < 0x80)
 		{
 			i++;
