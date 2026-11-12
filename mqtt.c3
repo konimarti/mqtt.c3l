@@ -1,5 +1,9 @@
 module mqtt;
 
+// The version of this library. It is also in project.json; tools/bump_version.c3 changes both and the test
+// version_matches_project_json checks that they are equal.
+const String VERSION = "0.1.0";
+
 // Naming convention: the FAULTS below are the library's error values and are always written
 // `mqtt::NAME` (or returned from a `T?` function). The wire reason codes are `ReasonCode.NAME`.
 // Three names exist in both (MALFORMED_PACKET, PROTOCOL_ERROR, PACKET_TOO_LARGE): the fault says

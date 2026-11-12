@@ -38,7 +38,7 @@ fn int main(String[] argv)
 			io::printn(args::USAGE);
 			return 0;
 		case VERSION:
-			io::printfn("mqttc %s", env::PROJECT_VERSION);
+			io::printfn("mqttc %s", mqtt::VERSION);
 			return 0;
 		default:
 			break;
