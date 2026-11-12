@@ -66,12 +66,9 @@ fn Duration Client.now(&self)
 // The Client does not own `transport` (the caller releases it); it does own `core`.
 fn void? Client.open(&self, Allocator allocator, Transport transport, Config* config, Duration timeout)
 {
-	// open starts a new session: what an earlier open left behind is released first
-	if (self.opened)
-	{
-		self.core.free();
-		self.opened = false;
-	}
+	// open starts a new session: what an earlier open left behind (the core, and the read buffer with the allocator
+	// that made it) is released first
+	if (self.opened || self.rbuf.len > 0) self.close();
 	self.allocator = allocator;
 	self.transport = transport;
 	self.origin = clock::now();
@@ -93,9 +90,9 @@ fn void? Client.open(&self, Allocator allocator, Transport transport, Config* co
 fn void? Client.reconnect(&self, Transport transport, Duration timeout)
 {
 	if (!self.opened) return mqtt::NOT_CONNECTED~;
-	self.transport = transport;
 	Duration deadline = self.deadline_after(timeout);
-	self.core.connect(self.now())!;
+	self.core.connect(self.now())!;                         // faults (ALREADY_CONNECTED) leave the old link in place
+	self.transport = transport;
 	return self.wait_connected(deadline);
 }
 

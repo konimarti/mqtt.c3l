@@ -632,3 +632,43 @@ fn void client_reads_of_single_bytes() @test
 	c.close();
 	s.leak_check();
 }
+
+fn void client_open_with_another_allocator_releases_the_first_buffer() @test
+{
+	TrackingAllocator t1;
+	TrackingAllocator t2;
+	t1.init(mem);
+	t2.init(mem);
+	Script s1;
+	Script s2;
+	Client c;
+	Config cf = cfg();
+	s1.on_write(0x10, "20 02 00 00");
+	s2.on_write(0x10, "20 02 00 00");
+	c.use_clock(&script_clock, &s1);
+	c.open(&t1, (Transport)&s1, &cf, time::sec(5))!!;
+	c.open(&t2, (Transport)&s2, &cf, time::sec(5))!!;
+	assert(t1.allocation_count() == 0, "everything of the first open went back to its own allocator");
+	c.close();
+	assert(t2.allocation_count() == 0);
+	t1.free();
+	t2.free();
+}
+
+fn void client_reconnect_refused_cases_keep_the_link() @test
+{
+	Script s;
+	Script other;
+	Client c;
+	Config cf = cfg();
+	assert(@catch(c.reconnect((Transport)&other, time::sec(1))) == mqtt::NOT_CONNECTED, "never opened");
+	start(&c, &s, &cf);
+	assert(@catch(c.reconnect((Transport)&other, time::sec(1))) == mqtt::ALREADY_CONNECTED, "still connected");
+	// the client still talks to the first link
+	OutMessage m = { .topic = "a", .payload = testutil::hex("01") };
+	c.publish(&m, time::sec(1))!!;
+	assert(wrote(&s, "30 04 00 01 61 01"), "written to the link that is connected");
+	assert(other.out_len == 0, "nothing went to the refused transport");
+	c.close();
+	s.leak_check();
+}
