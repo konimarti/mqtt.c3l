@@ -447,3 +447,44 @@ fn void reauth_with_a_hook_starts_it_afresh() @test
 	harness::expect_out(&s.core, "F0 0B 18 09 15 00 01 6D 16 00 02 72 31");
 	s.close();
 }
+
+// ---- redirects the other way round, and a damaged reference ----
+
+fn void redirect_codes_in_the_other_packet() @test
+{
+	// 0x9D (server moved) in a CONNACK
+	Session s;
+	Config c = core::default_config(Version.V5, "a");
+	s.mem_track.init(mem);
+	s.core.init(&s.mem_track, &c)!!;
+	s.core.connect(s.clock.now)!!;
+	s.core.output_done(s.core.pending_output().len);
+	char[] moved = testutil::hex("20 07 00 9D 04 1C 00 01 62");
+	assert(@catch(s.core.input(s.clock.now, moved)) == mqtt::CONNECTION_REFUSED);
+	Event ev = s.take();
+	assert(ev.closed.reason == ReasonCode.SERVER_MOVED && ev.closed.server_reference == "b" && ev.closed.by_server);
+	s.close();
+	// 0x9C (use another server) in a DISCONNECT
+	Session t;
+	Config d = core::default_config(Version.V5, "a");
+	t.open(&d, CONNACK_5);
+	char[] other = testutil::hex("E0 0B 9C 09 1C 00 06 68 6F 73 74 3A 31");
+	assert(@catch(t.core.input(t.clock.now, other)) == mqtt::SERVER_DISCONNECTED);
+	ev = t.take();
+	assert(ev.closed.reason == ReasonCode.USE_ANOTHER_SERVER && ev.closed.server_reference == "host:1");
+	t.close();
+}
+
+fn void damaged_server_reference() @test
+{
+	Session s;
+	Config c = core::default_config(Version.V5, "a");
+	s.mem_track.init(mem);
+	s.core.init(&s.mem_track, &c)!!;
+	s.core.connect(s.clock.now)!!;
+	s.core.output_done(s.core.pending_output().len);
+	char[] bad = testutil::hex("20 07 00 9C 04 1C 00 01 FF");           // not UTF-8
+	assert(@catch(s.core.input(s.clock.now, bad)) == mqtt::INVALID_UTF8);
+	assert(s.core.state == State.DISCONNECTED);
+	s.close();
+}
