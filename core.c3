@@ -110,7 +110,7 @@ enum EventKind : char
 	PUBLISH_DONE,   // outbound QoS 1/2 finished (PUBACK or PUBCOMP) or failed (reason >= 0x80)
 	SUBSCRIBED,     // SUBACK
 	UNSUBSCRIBED,   // UNSUBACK
-	AUTH,           // AUTH packet received, no hook (or hook returned CONTINUE)
+	AUTH,           // an AUTH packet for the application: a challenge when there is no AuthHook, or the end of a re-authentication
 	CLOSED,         // connection ended: server DISCONNECT, error, or our DISCONNECT flushed;
 	// always delivered after every event queued before it
 	PONG,           // PINGRESP (informational)
@@ -481,6 +481,8 @@ fn void? Core.connect(&self, Duration now)
 	self.ping_outstanding = false;
 	self.limits = {};
 	Config* c = &self.config;
+	DString initial = dstring::new(self.allocator);
+	defer initial.free();
 	Packet p = { .type = PacketType.CONNECT };
 	Connect* k = &p.connect;
 	k.client_id = c.client_id.len > 0 ? c.client_id : self.assigned_id;
@@ -538,10 +540,17 @@ fn void? Core.connect(&self, Duration now)
 		{
 			pr.set(PropId.AUTHENTICATION_METHOD);
 			pr.auth_method = c.auth_method;
-			if (c.auth_data.len > 0)
+			char[] data = c.auth_data;
+			if (c.has_auth_hook)
+			{
+				// the hook supplies the first Authentication Data
+				if (catch err = c.auth_hook.initial(&initial)) return mqtt::AUTH_FAILED~;
+				data = (char[])initial.str_view();
+			}
+			if (data.len > 0)
 			{
 				pr.set(PropId.AUTHENTICATION_DATA);
-				pr.auth_data = c.auth_data;
+				pr.auth_data = data;
 			}
 		}
 	}
@@ -607,7 +616,7 @@ fn void? Core.handle_frame(&self, Duration now, usz off, usz n)
 	}
 	Packet* p = &decoded;
 	// the first packet from the server must be CONNACK
-	if (self.state == State.CONNECTING && p.type != PacketType.CONNACK) return self.fail(now, mqtt::PROTOCOL_ERROR);
+	if (self.state == State.CONNECTING && p.type != PacketType.CONNACK && p.type != PacketType.AUTH) return self.fail(now, mqtt::PROTOCOL_ERROR);
 	switch (p.type)
 	{
 		case PacketType.CONNACK:
@@ -639,6 +648,8 @@ fn void? Core.handle_frame(&self, Duration now, usz off, usz n)
 			self.handle_ack(now, off, n, p)!;
 		case PacketType.PUBREL:
 			self.handle_pubrel(now, p)!;
+		case PacketType.AUTH:
+			self.handle_auth(now, off, n, p)!;
 		default:
 			break;
 	}
@@ -785,6 +796,7 @@ fn void Core.emit_closed(&self, Duration now, fault cause, ReasonCode reason, bo
 fn ReasonCode reason_for(fault cause) @private
 {
 	if (cause == mqtt::PACKET_TOO_LARGE) return ReasonCode.PACKET_TOO_LARGE;
+	if (cause == mqtt::AUTH_FAILED) return ReasonCode.NOT_AUTHORIZED;
 	if (cause == mqtt::TOPIC_ALIAS_INVALID) return ReasonCode.TOPIC_ALIAS_INVALID;
 	if (cause == mqtt::RECEIVE_MAXIMUM_EXCEEDED) return ReasonCode.RECEIVE_MAXIMUM_EXCEEDED;
 	if (cause == mqtt::PAYLOAD_FORMAT_INVALID) return ReasonCode.PAYLOAD_FORMAT_INVALID;
@@ -874,6 +886,9 @@ fn bool Core.poll_event(&self, Event* ev)
 				.packet_id = u.packet_id,
 				.props = u.props,
 			};
+		case EventKind.AUTH:
+			Packet p = packet::decode(self.config.version, self.in_buf.entries[rec.frame_off:rec.frame_len])!!;
+			ev.auth = { .reason = (ReasonCode)p.auth.reason, .method = p.auth.props.auth_method, .data = p.auth.props.auth_data };
 		case EventKind.PUBLISH_DONE:
 			ev.done = { .packet_id = rec.packet_id, .reason = rec.reason };
 			if (rec.frame_len > 0)
@@ -1131,6 +1146,72 @@ fn ushort? Core.unsubscribe(&self, Duration now, String[] filters, Properties* p
 	}
 	self.pending.push({ .id = id, .kind = PendingKind.UNSUBSCRIBE, .count = filters.len });
 	return id;
+}
+
+// ---- enhanced authentication [5.0 4.12, 3.15] ----
+
+// An AUTH packet from the server: a challenge (reason 0x18) while connecting or re-authenticating, or the
+// end of a re-authentication (reason 0). It must name the method we asked for. With an AuthHook the core
+// answers a challenge itself; without one the application gets an AUTH event and replies with send_auth.
+fn void? Core.handle_auth(&self, Duration now, usz off, usz n, Packet* p)
+{
+	Auth* a = &p.auth;
+	Config* c = &self.config;
+	if (c.auth_method.len == 0) return self.fail(now, mqtt::PROTOCOL_ERROR);       // we never asked for enhanced authentication
+	if (!a.props.has(PropId.AUTHENTICATION_METHOD) || a.props.auth_method != c.auth_method) return self.fail(now, mqtt::PROTOCOL_ERROR);
+	if (a.reason == (char)ReasonCode.SUCCESS)
+	{
+		// the end of a re-authentication; while connecting the CONNACK ends the exchange
+		if (self.state != State.CONNECTED) return self.fail(now, mqtt::PROTOCOL_ERROR);
+		self.events.push({ .kind = EventKind.AUTH, .frame_off = off, .frame_len = n });
+		return;
+	}
+	if (a.reason != (char)ReasonCode.CONTINUE_AUTHENTICATION) return self.fail(now, mqtt::PROTOCOL_ERROR);
+	if (!c.has_auth_hook)
+	{
+		self.events.push({ .kind = EventKind.AUTH, .frame_off = off, .frame_len = n });
+		return;
+	}
+	DString out = dstring::new(self.allocator);
+	defer out.free();
+	AuthAction? action = c.auth_hook.step(a.props.auth_data, &out);
+	if (catch err = action) return self.fail(now, mqtt::AUTH_FAILED);
+	switch (action)
+	{
+		case AuthAction.CONTINUE:
+			if (catch err = self.queue_auth(now, ReasonCode.CONTINUE_AUTHENTICATION, (char[])out.str_view())) return self.fail(now, err);
+		case AuthAction.DONE:
+			break;                                               // nothing to send: the CONNACK or the final AUTH follows
+		case AuthAction.FAIL:
+			return self.fail(now, mqtt::AUTH_FAILED);
+	}
+}
+
+fn void? Core.queue_auth(&self, Duration now, ReasonCode reason, char[] data)
+{
+	Packet p = { .type = PacketType.AUTH };
+	p.auth.reason = (char)reason;
+	p.auth.props.set(PropId.AUTHENTICATION_METHOD);
+	p.auth.props.auth_method = self.config.auth_method;
+	if (data.len > 0)
+	{
+		p.auth.props.set(PropId.AUTHENTICATION_DATA);
+		p.auth.props.auth_data = data;
+	}
+	self.queue_packet(now, &p)!;
+}
+
+// Sends an AUTH packet: the answer to a challenge (CONTINUE_AUTHENTICATION, while connecting or connected) or
+// the start of a re-authentication (RE_AUTHENTICATE, connected). Needs a 5.0 Config with an auth_method.
+// Faults: INVALID_ARGUMENT, NOT_CONNECTED.
+fn void? Core.send_auth(&self, Duration now, ReasonCode reason, char[] data)
+{
+	if (!is_v5(&self.config) || self.config.auth_method.len == 0) return mqtt::INVALID_ARGUMENT~;
+	if (self.state != State.CONNECTING && self.state != State.CONNECTED) return mqtt::NOT_CONNECTED~;
+	bool ok = reason == ReasonCode.CONTINUE_AUTHENTICATION || (reason == ReasonCode.RE_AUTHENTICATE && self.state == State.CONNECTED);
+	if (!ok) return mqtt::INVALID_ARGUMENT~;
+	Duration t = self.tick(now);
+	self.queue_auth(t, reason, data)!;
 }
 
 // ---- topic aliases ----
@@ -1722,8 +1803,6 @@ fn void? Core.handle_pubrel(&self, Duration now, Packet* p)
 	self.send_or_fail(now, &c)!;
 }
 
-// Manual AUTH (5.0 3.15): continue or re-authenticate (reason 0x19).
-fn void? Core.send_auth(&self, Duration now, ReasonCode reason, char[] data) { return mqtt::NOT_CONNECTED~; }
 // Counts for monitoring and tests.
 fn usz Core.inflight_count(&self) => (usz)self.inflight.len();
 fn usz Core.queued_count(&self) => (usz)self.queue.len();
