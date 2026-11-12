@@ -473,10 +473,144 @@ fn void vec_V_STR_N10() @test { expect_fault(hx("30 05 00 03 E0 80 80"), mqtt::I
 fn void vec_V_STR_N11() @test { expect_fault(hx("30 04 00 09 61 62"), mqtt::MALFORMED_PACKET); }
 fn void vec_V_STR_N12() @test { expect_fault(hx("30 03 00 05 61"), mqtt::MALFORMED_PACKET); }
 
-// ---- not yet handled packet types ----
+// ---- SUBSCRIBE, SUBACK, UNSUBSCRIBE, UNSUBACK ----
 
-fn void later_types_are_not_decoded_yet() @test
+fn void vec_V_311_SUB_1() @test
 {
-	// SUBSCRIBE and friends arrive with the next codec step
-	assert(@catch(packet::decode(Version.V311, hx("C0 00"))) == mqtt::INVALID_ARGUMENT);
+	Packet p = roundtrip(hx("82 08 00 01 00 03 61 2F 23 01"));
+	assert(p.type == PacketType.SUBSCRIBE && p.subscribe.packet_id == 1);
+	usz cursor;
+	SubEntry e;
+	assert(p.subscribe.next(&cursor, Version.V311, &e)!!);
+	assert(e.filter == "a/#" && e.qos == QoS.AT_LEAST_ONCE);
+	assert(!p.subscribe.next(&cursor, Version.V311, &e)!!, "one filter only");
+
+	Packet q = { .type = PacketType.SUBSCRIBE };
+	SubEntry[1] entries = { { .filter = "a/#", .qos = QoS.AT_LEAST_ONCE } };
+	q.subscribe = { .packet_id = 1, .entries = entries[..] };
+	char[16] buf;
+	usz n = packet::encode(Version.V311, &q, buf[..])!!;
+	assert(buf[:n] == hx("82 08 00 01 00 03 61 2F 23 01"));
+}
+
+fn void vec_V_311_SUB_2() @test
+{
+	Packet p = roundtrip(hx("82 0E 00 05 00 03 61 2F 62 00 00 03 63 2F 2B 02"));
+	assert(p.subscribe.packet_id == 5);
+	usz cursor;
+	SubEntry e;
+	assert(p.subscribe.next(&cursor, Version.V311, &e)!!);
+	assert(e.filter == "a/b" && e.qos == QoS.AT_MOST_ONCE);
+	assert(p.subscribe.next(&cursor, Version.V311, &e)!!);
+	assert(e.filter == "c/+" && e.qos == QoS.EXACTLY_ONCE);
+	assert(!p.subscribe.next(&cursor, Version.V311, &e)!!);
+}
+
+fn void vec_V_311_SUBACK_1() @test
+{
+	Packet p = roundtrip(hx("90 03 00 01 01"));
+	assert(p.type == PacketType.SUBACK && p.suback.packet_id == 1 && p.suback.codes == hx("01"));
+}
+
+fn void vec_V_311_SUBACK_2() @test
+{
+	Packet p = roundtrip(hx("90 04 00 05 00 80"));
+	assert(p.suback.packet_id == 5 && p.suback.codes == hx("00 80"));
+}
+
+fn void vec_V_311_UNSUB() @test
+{
+	Packet p = roundtrip(hx("A2 07 00 02 00 03 61 2F 23"));
+	assert(p.type == PacketType.UNSUBSCRIBE && p.unsubscribe.packet_id == 2);
+	usz cursor;
+	String f;
+	assert(p.unsubscribe.next(&cursor, &f)!!);
+	assert(f == "a/#");
+	assert(!p.unsubscribe.next(&cursor, &f)!!);
+
+	Packet q = { .type = PacketType.UNSUBSCRIBE };
+	String[1] filters = { "a/#" };
+	q.unsubscribe = { .packet_id = 2, .filters = filters[..] };
+	char[16] buf;
+	usz n = packet::encode(Version.V311, &q, buf[..])!!;
+	assert(buf[:n] == hx("A2 07 00 02 00 03 61 2F 23"));
+}
+
+fn void vec_V_311_UNSUBACK() @test
+{
+	Packet p = roundtrip(hx("B0 02 00 02"));
+	assert(p.type == PacketType.UNSUBACK && p.suback.packet_id == 2 && p.suback.codes.len == 0);
+}
+
+fn void vec_V_FR_1() @test { assert(roundtrip(hx("C0 00")).type == PacketType.PINGREQ); }
+fn void vec_V_FR_2() @test { assert(roundtrip(hx("D0 00")).type == PacketType.PINGRESP); }
+fn void vec_V_FR_3() @test { assert(roundtrip(hx("E0 00")).type == PacketType.DISCONNECT); }
+
+fn void vec_V_FR_N2() @test
+{
+	// type 15 is reserved in 3.1.1 (the 5.0 half is checked with the 5.0 codec)
+	assert(packet::frame_length(hx("F0 00"), 0)!! == 2);
+	expect_fault(hx("F0 00"), mqtt::PROTOCOL_ERROR);
+}
+
+fn void vec_V_FR_N4() @test
+{
+	assert(dec(hx("82 08 00 01 00 03 61 2F 23 01")).type == PacketType.SUBSCRIBE);
+	expect_fault(hx("80 08 00 01 00 03 61 2F 23 01"), mqtt::MALFORMED_PACKET);
+}
+
+fn void vec_V_FR_N5() @test { expect_fault(hx("A0 07 00 02 00 03 61 2F 23"), mqtt::MALFORMED_PACKET); }
+fn void vec_V_FR_N7() @test { expect_fault(hx("C1 00"), mqtt::MALFORMED_PACKET); }
+fn void vec_V_FR_N8() @test { expect_fault(hx("D0 01 00"), mqtt::MALFORMED_PACKET); }
+
+fn void vec_V_311_N16() @test { expect_fault(hx("90 02 00 01"), mqtt::MALFORMED_PACKET); }
+fn void vec_V_311_N17() @test { expect_fault(hx("90 03 00 01 03"), mqtt::MALFORMED_PACKET); }
+fn void vec_V_311_N18() @test { expect_fault(hx("90 03 00 00 01"), mqtt::MALFORMED_PACKET); }
+fn void vec_V_311_N19() @test { expect_fault(hx("82 05 00 01 00 01 61"), mqtt::MALFORMED_PACKET); }
+fn void vec_V_311_N20() @test { expect_fault(hx("82 02 00 01"), mqtt::MALFORMED_PACKET); }
+fn void vec_V_311_N21() @test { expect_fault(hx("82 08 00 01 00 03 61 2F 23 04"), mqtt::MALFORMED_PACKET); }
+fn void vec_V_311_N22() @test { expect_fault(hx("A2 02 00 02"), mqtt::MALFORMED_PACKET); }
+fn void vec_V_311_N23() @test { expect_fault(hx("B0 03 00 02 00"), mqtt::MALFORMED_PACKET); }
+fn void vec_V_311_N24() @test { expect_fault(hx("E0 01 00"), mqtt::MALFORMED_PACKET); }
+
+fn void subscribe_more_malformed() @test
+{
+	expect_fault(hx("82 08 00 00 00 03 61 2F 23 01"), mqtt::MALFORMED_PACKET);    // packet id 0
+	expect_fault(hx("82 08 00 01 00 03 61 2F 23 03"), mqtt::MALFORMED_PACKET);    // QoS 3
+	expect_fault(hx("82 08 00 01 00 03 61 2F 23 21"), mqtt::MALFORMED_PACKET);    // reserved bit 5
+	expect_fault(hx("82 05 00 01 00 00 01"), mqtt::INVALID_TOPIC_FILTER);          // empty filter
+	expect_fault(hx("82 08 00 01 00 03 61 C0 80 01"), mqtt::INVALID_UTF8);
+	// second entry cut off: caught at decode, not later
+	expect_fault(hx("82 0C 00 01 00 03 61 2F 23 01 00 03 62"), mqtt::MALFORMED_PACKET);
+	expect_fault(hx("A2 04 00 02 00 03"), mqtt::MALFORMED_PACKET);                  // filter cut off
+	expect_fault(hx("A2 05 00 00 00 01 61"), mqtt::MALFORMED_PACKET);               // packet id 0
+	expect_fault(hx("B0 02 00 00"), mqtt::MALFORMED_PACKET);
+	expect_fault(hx("C0 01 00"), mqtt::MALFORMED_PACKET);
+	expect_fault(hx("E1 00"), mqtt::MALFORMED_PACKET);
+}
+
+fn void subscribe_encode_refusals() @test
+{
+	Packet p = { .type = PacketType.SUBSCRIBE };
+	expect_encode_fault(&p, mqtt::INVALID_ARGUMENT);                    // no id, no entries
+	SubEntry[1] e = { { .filter = "" } };
+	p.subscribe = { .packet_id = 1, .entries = e[..] };
+	expect_encode_fault(&p, mqtt::INVALID_TOPIC_FILTER);
+	e[0] = { .filter = "a", .no_local = true };                          // 5.0 option on a 3.1.1 packet
+	expect_encode_fault(&p, mqtt::INVALID_ARGUMENT);
+	p.type = PacketType.UNSUBSCRIBE;
+	String[] none = {};
+	p.unsubscribe = { .packet_id = 1, .filters = none };
+	expect_encode_fault(&p, mqtt::INVALID_ARGUMENT);
+	p.type = PacketType.SUBACK;
+	char[1] bad = { 3 };
+	p.suback = { .packet_id = 1, .codes = bad[..] };
+	expect_encode_fault(&p, mqtt::INVALID_ARGUMENT);
+	p.type = PacketType.AUTH;
+	expect_encode_fault(&p, mqtt::INVALID_ARGUMENT);                    // AUTH is not in 3.1.1
+}
+
+fn void v5_is_not_implemented_yet() @test
+{
+	assert(@catch(packet::decode(Version.V5, hx("C0 00"))) == mqtt::UNSUPPORTED_VERSION);
 }
