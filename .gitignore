@@ -1,3 +1,4 @@
 build/
 obj/
 .work/
+__pycache__/
