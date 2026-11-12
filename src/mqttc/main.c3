@@ -1,10 +1,11 @@
 module mqttc;
-import mqtt, mqtt::core, mqtt::client, mqtt::tcp, mqtt::transport, mqtt::redirect, mqttc::args;
-import std::io, std::io::file, std::core::env, std::os::env, std::time;
+import mqtt, mqtt::core, mqtt::client, mqtt::tcp, mqtt::transport, mqttc::args, mqttc::cli;
+import std::io, std::core::env, std::os::env, std::time;
 
 const long CONNECT_SECONDS = 5;
 const long WAIT_SECONDS = 10;
 const String WARN_FLAG = "mqttc: warning: -P is visible in the process list; use --password-file or MQTT_PASSWORD";
+const String WARN_LOOSE = "mqttc: warning: the file with the credentials can be read by other users";
 
 // How one connection ended: done with a result code, or the server sent the client somewhere else.
 struct Outcome
@@ -45,84 +46,77 @@ fn int main(String[] argv)
 	return run(&a);
 }
 
-fn int run(Args* a)
+// The connection settings; with `credentials` false the user name, password and will stay out (a redirect to another host).
+fn Config settings(Args* a, String id, Secret* secret, Will* will, bool credentials)
 {
-	char[] secret;
-	bool has_secret;
-	if (catch err = load_secret(a, &secret, &has_secret))
-	{
-		io::eprintfn("mqttc: cannot read the credentials: %s", err);
-		return 1;
-	}
-	defer foreach (&b : secret) *b = 0;
-	String id = a.client_id.len > 0 ? a.client_id : args::random_client_id(mem);
 	Config config = core::default_config(a.version, id);
 	config.keep_alive = a.keep_alive;
 	config.clean_start = !a.keep_session;
-	if (a.user.len > 0 && has_secret)
+	if (!credentials) return config;
+	if (a.user.len > 0 && secret.present)
 	{
-		config.set_credentials(a.user, secret);
+		config.set_credentials(a.user, secret.bytes);
 	}
 	else if (a.user.len > 0)
 	{
 		config.set_username_only(a.user);
 	}
-	else if (has_secret)
-	{
-		config.set_password_only(secret);
-	}
-	Will will;
 	if (a.will_topic.len > 0)
 	{
-		will = { .topic = a.will_topic, .payload = (char[])a.will_msg };
-		config.will = &will;
+		*will = { .topic = a.will_topic, .payload = (char[])a.will_msg };
+		config.will = will;
 	}
+	return config;
+}
+
+fn int run(Args* a)
+{
+	String? from_env = env::get_var(mem, "MQTT_PASSWORD");
+	Secret? found = cli::resolve_secret(mem, a, from_env ?? "", @ok(from_env));
+	if (catch err = found)
+	{
+		if (err == cli::EMPTY_SECRET)
+		{
+			io::eprintn("mqttc: the secret you gave is empty");
+		}
+		else
+		{
+			io::eprintfn("mqttc: cannot read the credentials: %s", err);
+		}
+		return 1;
+	}
+	Secret secret = found;
+	defer foreach (&b : secret.bytes) *b = 0;
+	if (secret.from_flag) io::eprintn(WARN_FLAG);
+	if (secret.loose_permissions) io::eprintn(WARN_LOOSE);
+	String id = a.client_id.len > 0 ? a.client_id : args::random_client_id(mem);
+	Will will;
 	String host = a.host;
 	int port = a.port;
 	int hops;
+	long seen;                                     // messages of sub, over all the connections
 	while (true)
 	{
+		bool same_host = hops == 0 || a.redirect_credentials || cli::redirect_allowed(a.host, host);
+		Config config = settings(a, id, &secret, &will, same_host);
 		if (a.verbose) io::eprintfn("connecting to %s:%d as %s", host, port, id);
-		Outcome o = session(a, &config, host, port);
+		Outcome o = session(a, &config, host, port, &seen);
 		if (!o.redirected) return o.code;
 		if (++hops > args::MAX_HOPS)
 		{
 			io::eprintfn("mqttc: more than %d redirects", args::MAX_HOPS);
 			return 1;
 		}
+		if (!a.redirect_credentials && !cli::redirect_allowed(a.host, o.host))
+		{
+			io::eprintfn("mqttc: redirected to %s: the credentials and the will are not sent there (--redirect-credentials)", o.host);
+		}
 		host = o.host;
 		port = o.port;
 	}
 }
 
-// -P is visible to every user of the machine: it is taken last, and with a warning.
-fn void? load_secret(Args* a, char[]* secret, bool* has_secret)
-{
-	if (a.password_file.len > 0)
-	{
-		char[] raw = file::load(mem, a.password_file)!;
-		usz n = raw.len;
-		while (n > 0 && (raw[n - 1] == '\n' || raw[n - 1] == '\r')) n--;
-		*secret = raw[:n];
-		*has_secret = true;
-		return;
-	}
-	String? from_env = env::get_var(mem, "MQTT_PASSWORD");
-	if (try from_env)
-	{
-		*secret = (char[])from_env;
-		*has_secret = true;
-		return;
-	}
-	if (a.has_password_flag)
-	{
-		io::eprintn(WARN_FLAG);
-		*secret = (char[])a.password_flag;
-		*has_secret = true;
-	}
-}
-
-fn Outcome session(Args* a, Config* config, String host, int port)
+fn Outcome session(Args* a, Config* config, String host, int port, long* seen)
 {
 	TcpTransport? link = tcp::connect(host, port, time::sec(CONNECT_SECONDS));
 	if (catch err = link)
@@ -136,52 +130,30 @@ fn Outcome session(Args* a, Config* config, String host, int port)
 	defer c.close();
 	if (catch err = c.open(mem, (Transport)&t, config, time::sec(CONNECT_SECONDS)))
 	{
-		Outcome o = follow(a, &c);
-		if (o.redirected) return o;
-		if (err == mqtt::CONNECTION_REFUSED)
+		Failure f = cli::closed_event(mem, a, &c);
+		if (f.redirected) return { .redirected = true, .host = f.host, .port = f.port };
+		if (err == mqtt::CONNECTION_REFUSED && f.reason.len > 0)
 		{
-			Event ev;
-			if (try c.next(&ev, time::DURATION_ZERO) && ev.kind == EventKind.CLOSED)
-			{
-				io::eprintfn("mqttc: connection refused: %s", ev.closed.reason.describe());
-				return { .code = 1 };
-			}
+			io::eprintfn("mqttc: connection refused: %s", f.reason);
+			return { .code = 1 };
 		}
 		io::eprintfn("mqttc: cannot connect to %s:%d: %s", host, port, err);
 		return { .code = 1 };
 	}
 	if (a.verbose) io::eprintn("connected");
 	if (a.mode == Mode.PUB) return publish(a, &c);
-	return subscribe(a, &c);
-}
-
-// After a refused connection or a server DISCONNECT: the redirect target the server named, if asked to follow it.
-fn Outcome follow(Args* a, Client* c)
-{
-	if (!a.follow_redirect) return {};
-	Event ev;
-	bool? got = c.next(&ev, time::DURATION_ZERO);
-	if (catch got) return {};
-	if (!got || ev.kind != EventKind.CLOSED) return {};
-	return redirect_of(a, &ev);
-}
-
-fn Outcome redirect_of(Args* a, Event* ev)
-{
-	if (!a.follow_redirect || ev.closed.server_reference.len == 0) return {};
-	String host;
-	int port;
-	if (!redirect::parse_server_reference(ev.closed.server_reference, &host, &port, args::DEFAULT_PORT))
-	{
-		io::eprintfn("mqttc: the server sent a redirect that cannot be used: %s", ev.closed.server_reference);
-		return {};
-	}
-	return { .redirected = true, .host = host.copy(mem), .port = port };
+	return subscribe(a, &c, seen);
 }
 
 fn Outcome publish(Args* a, Client* c)
 {
-	OutMessage m = { .topic = a.topic, .payload = (char[])a.message, .qos = a.qos, .retain = a.retain };
+	char[]? data = cli::payload_of(mem, a);
+	if (catch err = data)
+	{
+		io::eprintfn("mqttc: cannot use the payload: %s", err == args::REFUSED_CLEAR_RETAINED ? args::message(err) : "the file cannot be read");
+		return { .code = 2 };
+	}
+	OutMessage m = { .topic = a.topic, .payload = data, .qos = a.qos, .retain = a.retain };
 	int code;
 	if (a.qos == QoS.AT_MOST_ONCE)
 	{
@@ -210,7 +182,7 @@ fn Outcome publish(Args* a, Client* c)
 	return { .code = code };
 }
 
-fn Outcome subscribe(Args* a, Client* c)
+fn Outcome subscribe(Args* a, Client* c, long* seen)
 {
 	SubEntry[1] entries = { { .filter = a.topic, .qos = a.qos, .no_local = a.no_local } };
 	char[1] granted;
@@ -225,7 +197,6 @@ fn Outcome subscribe(Args* a, Client* c)
 		return { .code = 1 };
 	}
 	if (a.verbose) io::eprintfn("subscribed to %s, granted QoS %d", a.topic, granted[0]);
-	long seen;
 	Event ev;
 	while (true)
 	{
@@ -239,16 +210,22 @@ fn Outcome subscribe(Args* a, Client* c)
 		switch (ev.kind)
 		{
 			case MESSAGE:
-				io::printfn("%s %s", ev.message.topic, (String)ev.message.payload);
-				if (a.count > 0 && ++seen >= a.count)
+				// one line: the topic, a tab, the payload with control characters escaped
+				String line = cli::printable(tmem, (String)ev.message.payload);
+				if (catch io::printfn("%s\t%s", cli::printable(tmem, ev.message.topic), line))
+				{
+					io::eprintn("mqttc: cannot write to the standard output");
+					return { .code = 1 };
+				}
+				if (a.count > 0 && ++(*seen) >= a.count)
 				{
 					(void)c.disconnect(ReasonCode.NORMAL_DISCONNECTION, time::sec(WAIT_SECONDS));
 					return {};
 				}
 			case CLOSED:
-				Outcome o = redirect_of(a, &ev);
-				if (o.redirected) return o;
-				io::eprintfn("mqttc: connection closed: %s", ev.closed.reason.describe());
+				Failure f = cli::of_closed(mem, a, &ev);
+				if (f.redirected) return { .redirected = true, .host = f.host, .port = f.port };
+				io::eprintfn("mqttc: connection closed: %s", f.reason);
 				return { .code = 1 };
 			default:
 				break;

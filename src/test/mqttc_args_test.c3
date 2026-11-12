@@ -1,5 +1,6 @@
 module mqttc::args_test;
 import mqtt, mqttc::args;
+import std::core::env;
 
 fn bool fails_with(String[] argv, fault expected, String bad)
 {
@@ -36,7 +37,7 @@ fn void mqttc_args_sub_every_flag() @test
 {
 	Args a;
 	String[] argv = { "sub", "-t", "plant/#", "-q", "1", "-c", "3", "-C", "keep", "-i", "me", "--v5", "--no-local",
-		"--password-file", "/x/pw", "-P", "secret" };
+		"-u", "kim", "--password-file", "/x/pw", "-P", "secret" };
 	args::parse(argv, &a)!!;
 	assert(a.mode == Mode.SUB && a.topic == "plant/#" && a.qos == QoS.AT_LEAST_ONCE && a.count == 3);
 	assert(a.keep_session && a.version == Version.V5 && a.no_local);
@@ -110,4 +111,42 @@ fn void mqttc_args_random_client_ids_differ() @test
 	String b = args::random_client_id(tmem);
 	assert(a.starts_with("mqttc-") && a.len == 6 + 16);
 	assert(a != b, "two runs must not take each other over");
+}
+
+fn void mqttc_args_empty_values_are_refused() @test
+{
+	assert(fails_with({ "pub", "-t", "a", "-m", "x", "-u", "" }, args::BAD_VALUE, "-u"));
+	assert(fails_with({ "pub", "-t", "a", "-m", "x", "-i", "" }, args::BAD_VALUE, "-i"));
+	assert(fails_with({ "pub", "-t", "a", "-m", "x", "-h", "" }, args::BAD_VALUE, "-h"));
+	assert(fails_with({ "pub", "-t", "a", "-m", "x", "--will-topic", "", "--will-msg", "m" }, args::BAD_VALUE, "--will-topic"));
+	assert(fails_with({ "pub", "-t", "", "-m", "x" }, args::BAD_VALUE, "-t"), "the empty topic is named");
+}
+
+fn void mqttc_args_password_needs_a_user() @test
+{
+	assert(fails_with({ "sub", "-t", "a", "--password-file", "/x" }, args::BAD_COMBINATION, "--password-file"));
+	assert(fails_with({ "sub", "-t", "a", "-P", "x" }, args::BAD_COMBINATION, "-P"));
+	Args a;
+	args::parse({ "sub", "-t", "a", "-u", "kim", "-P", "x" }, &a)!!;
+}
+
+fn void mqttc_args_payload_from_a_file() @test
+{
+	Args a;
+	args::parse({ "pub", "-t", "a", "-f", "payload.bin" }, &a)!!;
+	assert(a.message_file == "payload.bin" && !a.has_message);
+	args::parse({ "pub", "-t", "a", "--file", "p", "--redirect-credentials" }, &a)!!;
+	assert(a.redirect_credentials);
+	assert(fails_with({ "pub", "-t", "a", "-m", "x", "-f", "p" }, args::BAD_COMBINATION, "-f"));
+	assert(fails_with({ "sub", "-t", "a", "-f", "p" }, args::UNKNOWN_FLAG, "-f"));
+}
+
+fn void mqttc_args_ids_come_from_the_operating_system() @test
+{
+	$if env::LINUX || env::DARWIN:
+		char[16] a;
+		char[16] b;
+		assert(args::os_random(a[..]) && args::os_random(b[..]));
+		assert(a != b, "two reads of the system generator differ");
+	$endif
 }
