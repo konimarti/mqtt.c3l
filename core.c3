@@ -236,6 +236,7 @@ struct Core
 	bool reached_connected;         // the current connection got a CONNACK that accepted it
 	Limits limits;                  // negotiated by CONNACK
 	String assigned_id;             // owned copy of the server assigned client identifier
+	sz resend_waiting;              // inflight records kept from an earlier connection that were not sent again yet
 	bool flow_stalled;              // resending or sending queued messages stopped: the output buffer is full
 	ulong[1024] id_used;            // bit per packet id: held by an inflight record or a pending request
 }
@@ -1434,6 +1435,7 @@ fn void Core.discard_session(&self)
 		self.free_block(&r);
 	}
 	self.inflight.clear();
+	self.resend_waiting = 0;
 	foreach (r : self.queue) self.free_block(&r);
 	self.queue.clear();
 	self.in_qos2.clear();
@@ -1444,6 +1446,7 @@ fn void Core.lose_inflight(&self)
 {
 	foreach (r : self.inflight) self.drop_record(&r, ReasonCode.UNSPECIFIED_ERROR);
 	self.inflight.clear();
+	self.resend_waiting = 0;
 	self.in_qos2.clear();
 }
 
@@ -1469,6 +1472,7 @@ fn void? Core.resume_session(&self, Duration now, bool session_present)
 	if (session_present)
 	{
 		for (sz i = 0; i < self.inflight.len(); i++) self.inflight.entries[i].needs_resend = true;
+		self.resend_waiting = self.inflight.len();
 	}
 	else
 	{
@@ -1476,6 +1480,14 @@ fn void? Core.resume_session(&self, Duration now, bool session_present)
 	}
 	self.resend_pending(now)!;
 	self.drain_queue(now)!;
+}
+
+// The record does not need to be sent again any more (it was answered, or sent).
+fn void Core.sent_again(&self, Inflight* r)
+{
+	if (!r.needs_resend) return;
+	r.needs_resend = false;
+	self.resend_waiting--;
 }
 
 // Sends records of an earlier connection again while the window of this one has room. A record the
@@ -1531,6 +1543,7 @@ fn void? Core.resend_pending(&self, Duration now)
 			{
 				Inflight dead = *r;
 				self.inflight.remove_at(i);
+				self.resend_waiting--;
 				self.drop_record(&dead, refused);
 				continue;
 			}
@@ -1543,6 +1556,7 @@ fn void? Core.resend_pending(&self, Duration now)
 			self.commit_alias(now, &plan, (String)r.block[:r.topic_len]);
 		}
 		r.needs_resend = false;
+		self.resend_waiting--;
 		active++;
 		i++;
 	}
@@ -1666,7 +1680,8 @@ fn ushort? Core.publish_acknowledged(&self, Duration now, OutMessage* msg)
 	if (size > self.config.effective_max_out_buffer()) return mqtt::QUEUE_FULL~;      // it would never fit: waiting would not help
 	self.check_outbound_size(&probe)!;
 	Inflight r = self.make_record(now, msg, explicit)!;
-	if (self.queue.len() > 0 || self.inflight.len() >= (sz)self.limits.send_quota)
+	// behind what waits in the queue, and behind records that still have to be sent again (the original order)
+	if (self.queue.len() > 0 || self.resend_waiting > 0 || self.inflight.len() >= (sz)self.limits.send_quota)
 	{
 		if ((usz)self.queue.len() >= self.config.effective_max_queued())
 		{
@@ -1698,7 +1713,7 @@ fn ushort? Core.publish_acknowledged(&self, Duration now, OutMessage* msg)
 // Sends queued messages while the window has room; a message whose expiry ran out while it waited is dropped.
 fn void? Core.drain_queue(&self, Duration now)
 {
-	while (self.queue.len() > 0 && self.inflight.len() < (sz)self.limits.send_quota)
+	while (self.queue.len() > 0 && self.resend_waiting == 0 && self.inflight.len() < (sz)self.limits.send_quota)
 	{
 		Inflight r = self.queue.entries[0];
 		if (r.expiry_s != 0 && self.remaining_expiry(now, &r) == 0)
@@ -1739,6 +1754,7 @@ fn void? Core.finish_record(&self, Duration now, sz idx, ReasonCode reason, usz 
 {
 	Inflight r = self.inflight.entries[idx];
 	self.inflight.remove_at(idx);
+	if (r.needs_resend) self.resend_waiting--;
 	self.free_block(&r);
 	self.release_id(r.id);
 	self.events.push({ .kind = EventKind.PUBLISH_DONE, .reason = reason, .packet_id = r.id, .frame_off = off, .frame_len = n });
@@ -1791,11 +1807,11 @@ fn void? Core.handle_ack(&self, Duration now, usz off, usz n, Packet* p)
 					else
 					{
 						r.state = InflightState.WAIT_PUBCOMP;
-						r.needs_resend = false;
+						self.sent_again(r);
 						self.send_pubrel(now, a.packet_id, 0)!;
 					}
 				case InflightState.WAIT_PUBCOMP:
-					r.needs_resend = false;                               // answered now: nothing left to send again
+					self.sent_again(r);                                   // answered now: nothing left to send again
 					self.send_pubrel(now, a.packet_id, 0)!;               // the PUBREC again: answer again
 				default:
 					return self.fail(now, mqtt::PROTOCOL_ERROR);

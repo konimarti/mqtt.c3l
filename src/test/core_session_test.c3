@@ -683,3 +683,38 @@ fn ushort[] ids_of_publishes5(char[] output)
 	}
 	return ids[:n];
 }
+
+// records that wait for room after a reconnect keep their place: nothing new goes out before them
+fn void new_messages_wait_behind_records_that_are_sent_again() @test
+{
+	Session s;
+	Config c = cfg(Version.V5);
+	c.max_out_buffer = 400;
+	s.open(&c, CONNACK_5);
+	for (char i = 1; i <= 3; i++)
+	{
+		OutMessage m = big_msg(QoS.AT_LEAST_ONCE, i);
+		s.core.publish(s.clock.now, &m)!!;
+		s.core.output_done(s.core.pending_output().len);
+	}
+	lose(&s);
+	reconnect(&s, CONNACK_5_SESSION);
+	ushort[] first = ids_of_publishes5(s.core.pending_output());
+	assert(first.len == 2 && first[0] == 1 && first[1] == 2, "room for two of the three");
+	// a new message must not slip in before the third record
+	OutMessage fresh = msg(QoS.AT_LEAST_ONCE, 9);
+	assert(s.core.publish(s.clock.now, &fresh)!! == 0, "it waits behind the records that are sent again");
+	assert(ids_of_publishes5(s.core.pending_output()).len == 2);
+	s.core.output_done(s.core.pending_output().len);
+	char[] rest = s.core.pending_output();
+	Packet a = packet::decode(Version.V5, rest[:packet::frame_length(rest, 0)!!])!!;
+	assert(a.publish.packet_id == 3 && a.publish.dup, "the old record first");
+	ushort[] ids = ids_of_publishes5(rest);
+	assert(ids.len == 2 && ids[0] == 3 && ids[1] == 4, "then the new message");
+	s.core.output_done(rest.len);
+	// the counter is back to zero: later messages go out at once
+	OutMessage later = msg(QoS.AT_LEAST_ONCE, 8);
+	assert(s.core.publish(s.clock.now, &later)!! != 0);
+	s.core.output_done(s.core.pending_output().len);
+	s.close();
+}
