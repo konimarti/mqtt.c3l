@@ -495,3 +495,24 @@ fn void client_publish_waits_for_the_window() @test
 	assert(wrote(&s, "32 07 00 01 62 00 02 00 02"));
 	c.close();
 }
+
+// ---- what a held event survives ----
+
+fn void client_held_event_survives_calls_that_only_write() @test
+{
+	Script s;
+	Client c;
+	Config cf = cfg();
+	start(&c, &s, &cf);
+	s.add("30 07 00 03 61 2F 62 68 69");
+	Event ev;
+	assert(c.next(&ev, time::sec(1))!!);
+	OutMessage m = { .topic = "x", .payload = testutil::hex("01") };
+	c.publish(&m, time::sec(1))!!;                                         // QoS 0: only writes
+	OutMessage q1 = { .topic = "x", .payload = testutil::hex("01"), .qos = QoS.AT_LEAST_ONCE };
+	c.publish(&q1, time::sec(1))!!;                                        // QoS 1 with room in the window: only writes
+	assert(ev.message.topic == "a/b" && ev.message.payload == testutil::hex("68 69"), "the held event is intact");
+	c.disconnect(ReasonCode.NORMAL_DISCONNECTION, time::sec(1))!!;
+	assert(ev.message.topic == "a/b");
+	c.close();
+}

@@ -44,12 +44,25 @@ may have left half a packet on the wire, so the client closes the transport and 
 ### Events borrow the core's buffer
 
 The topic and payload of a `MESSAGE` event (and the other data in an `Event`) point into the core's input buffer. They stay
-valid until the next call that reads from the transport (`next`, `publish_wait`, `subscribe`, ...). Copy what you need to keep.
-Calling `publish`, `subscribe` or `disconnect` while you hold an event is fine: they do not touch that buffer.
+valid until the next call that reads from the transport. Calls that only write leave them alone: `publish` (QoS 0, or QoS 1/2
+while the server's window has room) and `disconnect`. Calls that read end their life: `next`, `subscribe`, `unsubscribe`,
+`wait_done`, `publish_wait`, and `publish` when the window is full and it has to wait. Copy what you need to keep first.
 
-The waiting calls (`publish_wait`, `wait_done`, `subscribe`, `unsubscribe`) take only the answer they wait for. Everything else
-that arrives meanwhile stays queued for `next`. If the server floods the client while it waits, the input buffer fills up and the
-waiting call returns `QUEUE_FULL`: call `next` to take the events.
+The waiting calls take only the answer they wait for. Everything else that arrives meanwhile stays queued for `next`. If the
+server floods the client while it waits, the input buffer fills up and the waiting call returns `QUEUE_FULL`: call `next` to
+take the events.
+
+### Keep alive
+
+The PINGREQ is written, and a missing PINGRESP noticed, only while a call of the client is running (mostly `next`). Between
+calls nothing is serviced: call `next` regularly. A connection that went silent is found out after up to 1.75 times the keep
+alive (the PINGREQ goes out after 75 % of it, the reply may take one more keep alive).
+
+### Time
+
+Every blocking call takes a `Duration`. There is no "forever" constant: pass a very large one (`(Duration)long::max` works).
+A zero timeout polls once. `Client.reconnect` connects again on a new transport and keeps the session (messages that were not
+finished are sent again); `open` starts a new one.
 
 ## Notes
 

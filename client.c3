@@ -11,12 +11,16 @@ alias ClockFn = fn Duration(void* context);
 // time. Every blocking call takes a timeout (a Duration); the reads and writes it does are bounded by what is
 // left of it. Not thread safe.
 //
-// Events: `next` hands out the next event. Data in an Event is borrowed from the core's input buffer and stays
-// valid until the next call that reads from the transport; `publish` and the other commands never touch that
-// buffer, so they may be called while an Event is in hand. The waiting calls (publish_wait, wait_done,
-// subscribe, unsubscribe) take only the answer they wait for; every other event stays queued for `next`.
-// While they wait the input buffer keeps filling with what the server sends meanwhile; when it is full they
-// return QUEUE_FULL and the application has to call `next` to take the events.
+// Events: `next` hands out the next event. Data in an Event is borrowed from the core's input buffer and is valid
+// until the next call that reads from the transport. Calls that only write do not disturb it: `publish` (QoS 0, or
+// QoS 1/2 when the server's window has room) and `disconnect`. Calls that read invalidate held events: `next`,
+// `subscribe`, `unsubscribe`, `wait_done`, `publish_wait`, and `publish` when the window is full and it has to wait.
+// Copy what you need to keep before calling them. The waiting calls take only the answer they wait for; every other
+// event stays queued for `next`. While they wait the input buffer keeps filling with what the server sends meanwhile;
+// when it is full they return QUEUE_FULL and the application has to call `next` to take the events.
+// The keep-alive PINGREQ is written (and a missing PINGRESP noticed) only while one of these calls runs: between
+// calls the connection is not serviced, so call `next` regularly.
+// Timeouts are Durations; a huge one means "very long" (there is no forever constant), zero polls once.
 struct Client
 {
 	Core core;
