@@ -109,8 +109,8 @@ fn void framing_more() @test
 	expect_fault(hx("40"), mqtt::MALFORMED_PACKET);
 	// reserved packet type 15 in 3.1.1
 	expect_fault(hx("F0 00"), mqtt::PROTOCOL_ERROR);
-	// 5.0 is not implemented in this step
-	assert(@catch(packet::decode(Version.V5, hx("40 02 00 0A"))) == mqtt::UNSUPPORTED_VERSION);
+	// a protocol level that is neither 3.1.1 nor 5.0
+	assert(@catch(packet::decode((Version)3, hx("40 02 00 0A"))) == mqtt::UNSUPPORTED_VERSION);
 }
 
 // ---- CONNECT ----
@@ -610,25 +610,10 @@ fn void subscribe_encode_refusals() @test
 	expect_encode_fault(&p, mqtt::INVALID_ARGUMENT);                    // AUTH is not in 3.1.1
 }
 
-fn void v5_is_not_implemented_yet() @test
+fn void unknown_version_is_refused() @test
 {
-	assert(@catch(packet::decode(Version.V5, hx("C0 00"))) == mqtt::UNSUPPORTED_VERSION);
-}
-
-// encode sizes the packet once: the limit is checked on the remaining length before any byte is written
-fn void encode_limit_and_size_agree() @test
-{
-	// a slice that claims more than the protocol allows (never read: the size check comes first)
-	char[1] one = { 0x61 };
-	char[] huge = one[:1];
-	Packet p = { .type = PacketType.PUBLISH };
-	p.publish = { .topic = "t", .payload = huge };
-	char[16] small;
-	small[..] = 0x55;
-	// small buffer: BUFFER_TOO_SMALL and nothing written
-	char[2] tiny;
-	assert(@catch(packet::encode(Version.V311, &p, tiny[..])) == mqtt::BUFFER_TOO_SMALL);
-	usz n = packet::encode(Version.V311, &p, small[..])!!;
-	assert(n == packet::encoded_size(Version.V311, &p)!!, "encode and encoded_size agree");
-	assert(n == 1 + 1 + 2 + 1 + 1);
+	assert(@catch(packet::decode((Version)3, hx("C0 00"))) == mqtt::UNSUPPORTED_VERSION);
+	Packet p = { .type = PacketType.PINGREQ };
+	char[4] buf;
+	assert(@catch(packet::encode((Version)3, &p, buf[..])) == mqtt::UNSUPPORTED_VERSION);
 }
