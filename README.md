@@ -151,7 +151,8 @@ build/mqttc sub -h localhost -t 'plant/#' -q 1 -c 10
   `--allow-clear-retained` is given.
 - `--follow-redirect` follows a server redirect, at most 3 hops, from a refused CONNECT and, in `sub`, from a DISCONNECT of the
   server. User name, password and will go only to the host that was asked for (compared without regard to case); to another host
-  the connection is made without them, unless `--redirect-credentials` is given. A server DISCONNECT with a reference after a `pub`
+  the connection is made without them, unless `--redirect-credentials` is given. The client id (also one given with `-i`) is sent to the
+  other host either way. A server DISCONNECT with a reference after a `pub`
   has finished is not followed.
 - Limits: 5 s to connect, 10 s for every wait. Flags given twice: the last one counts; values are taken as they are, also when they start
   with `-`.

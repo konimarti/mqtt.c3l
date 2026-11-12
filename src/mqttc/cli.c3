@@ -1,6 +1,6 @@
 module mqttc::cli;
 import mqtt, mqtt::core, mqtt::client, mqtt::redirect, mqttc::args;
-import std::io::file, std::core::env, std::time, libc;
+import std::io, std::io::file, std::core::env, std::time, libc;
 
 // The parts of mqttc that decide something (credentials, redirects, what to tell the user about a failed
 // connection), kept out of main so that they can be tested without a terminal or a network.
@@ -139,4 +139,14 @@ fn char[]? payload_of(Allocator allocator, Args* a)
 	if (a.message_file.len > 0) data = file::load(allocator, a.message_file)!;
 	if (data.len == 0 && a.retain && !a.allow_clear_retained) return args::REFUSED_CLEAR_RETAINED~;
 	return data;
+}
+
+// One line for a message: the topic, a tab, the payload, both with control characters escaped. The text it builds is
+// given back when it returns: a `sub` that runs for days must not grow with every message.
+fn void? write_message(OutStream out, String topic, String payload)
+{
+	@pool()
+	{
+		io::fprintf(out, "%s\t%s\n", printable(tmem, topic), printable(tmem, payload))!;
+	};
 }

@@ -89,6 +89,18 @@ fn int run(Args* a)
 	defer foreach (&b : secret.bytes) *b = 0;
 	if (secret.from_flag) io::eprintn(WARN_FLAG);
 	if (secret.loose_permissions) io::eprintn(WARN_LOOSE);
+	// the payload is read, and refused if it must be, before anything goes to the network (and once, not per redirect)
+	char[] payload;
+	if (a.mode == Mode.PUB)
+	{
+		char[]? data = cli::payload_of(mem, a);
+		if (catch err = data)
+		{
+			io::eprintfn("mqttc: cannot use the payload: %s", err == args::REFUSED_CLEAR_RETAINED ? args::message(err) : "the file cannot be read");
+			return 2;
+		}
+		payload = data;
+	}
 	String id = a.client_id.len > 0 ? a.client_id : args::random_client_id(mem);
 	Will will;
 	String host = a.host;
@@ -100,7 +112,7 @@ fn int run(Args* a)
 		bool same_host = hops == 0 || a.redirect_credentials || cli::redirect_allowed(a.host, host);
 		Config config = settings(a, id, &secret, &will, same_host);
 		if (a.verbose) io::eprintfn("connecting to %s:%d as %s", host, port, id);
-		Outcome o = session(a, &config, host, port, &seen);
+		Outcome o = session(a, &config, host, port, &seen, payload);
 		if (!o.redirected) return o.code;
 		if (++hops > args::MAX_HOPS)
 		{
@@ -116,7 +128,7 @@ fn int run(Args* a)
 	}
 }
 
-fn Outcome session(Args* a, Config* config, String host, int port, long* seen)
+fn Outcome session(Args* a, Config* config, String host, int port, long* seen, char[] payload)
 {
 	TcpTransport? link = tcp::connect(host, port, time::sec(CONNECT_SECONDS));
 	if (catch err = link)
@@ -141,18 +153,12 @@ fn Outcome session(Args* a, Config* config, String host, int port, long* seen)
 		return { .code = 1 };
 	}
 	if (a.verbose) io::eprintn("connected");
-	if (a.mode == Mode.PUB) return publish(a, &c);
+	if (a.mode == Mode.PUB) return publish(a, &c, payload);
 	return subscribe(a, &c, seen);
 }
 
-fn Outcome publish(Args* a, Client* c)
+fn Outcome publish(Args* a, Client* c, char[] data)
 {
-	char[]? data = cli::payload_of(mem, a);
-	if (catch err = data)
-	{
-		io::eprintfn("mqttc: cannot use the payload: %s", err == args::REFUSED_CLEAR_RETAINED ? args::message(err) : "the file cannot be read");
-		return { .code = 2 };
-	}
 	OutMessage m = { .topic = a.topic, .payload = data, .qos = a.qos, .retain = a.retain };
 	int code;
 	if (a.qos == QoS.AT_MOST_ONCE)
@@ -210,9 +216,7 @@ fn Outcome subscribe(Args* a, Client* c, long* seen)
 		switch (ev.kind)
 		{
 			case MESSAGE:
-				// one line: the topic, a tab, the payload with control characters escaped
-				String line = cli::printable(tmem, (String)ev.message.payload);
-				if (catch io::printfn("%s\t%s", cli::printable(tmem, ev.message.topic), line))
+				if (catch cli::write_message(io::stdout(), ev.message.topic, (String)ev.message.payload))
 				{
 					io::eprintn("mqttc: cannot write to the standard output");
 					return { .code = 1 };

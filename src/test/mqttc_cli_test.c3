@@ -116,3 +116,20 @@ fn void mqttc_cli_redirect_from_a_refusal() @test
 	f = refused_by(connack, &plain);
 	assert(!f.redirected, "not asked to follow");
 }
+
+fn void mqttc_cli_write_message_does_not_grow_the_temp_memory() @test
+{
+	DString out;
+	out.init(mem);
+	defer out.free();
+	cli::write_message(&out, "plant/a", "line1\nline2")!!;
+	assert(out.str_view() == "plant/a\tline1\\x0aline2\n");
+	TempAllocator* t = (TempAllocator*)tmem;
+	sz before = t.used;
+	for (int i = 0; i < 2000; i++)
+	{
+		out.clear();
+		cli::write_message(&out, "plant/a", "a payload of some length, with a \t tab")!!;
+	}
+	assert(t.used == before, "every message gave its text back");
+}
