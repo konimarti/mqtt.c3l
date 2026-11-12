@@ -581,27 +581,34 @@ fn void? emit_body(Emit* e, Properties* p, PropContext ctx) @private
 	e.byte_prop(p, ctx, PropId.SHARED_SUBSCRIPTION_AVAILABLE, p.shared_sub_available)!;
 }
 
+// Length of the properties alone, without the length prefix. Validates like encode.
+fn usz? properties_body_size(Properties* p, PropContext ctx) @private
+{
+	Emit e = {};
+	emit_body(&e, p, ctx)!;
+	return e.n;
+}
+
 // Size in bytes of the block including its length prefix. Validates the properties like encode:
 // INVALID_PROPERTY (not allowed in ctx, zero/out-of-range value), INVALID_UTF8,
 // PACKET_TOO_LARGE (block above 268_435_455 bytes).
 fn usz? properties_size(Properties* p, PropContext ctx)
 {
-	Emit e = {};
-	emit_body(&e, p, ctx)!;
-	usz prefix = wire::vbi_size((uint)e.n);
-	if (e.n > mqtt::MAX_REMAINING_LENGTH || prefix == 0) return mqtt::PACKET_TOO_LARGE~;
-	return prefix + e.n;
+	usz body = properties_body_size(p, ctx)!;
+	usz prefix = wire::vbi_size((uint)body);
+	if (body > mqtt::MAX_REMAINING_LENGTH || prefix == 0) return mqtt::PACKET_TOO_LARGE~;
+	return prefix + body;
 }
 
-// Writes the length prefix and the properties, in ascending identifier order. Nothing is written
-// on a fault (BUFFER_TOO_SMALL included).
+// Writes the length prefix and the properties, in ascending identifier order. The properties are
+// validated and sized once. Nothing is written on a fault (BUFFER_TOO_SMALL included).
 fn void? ByteWriter.properties(&self, Properties* p, PropContext ctx)
 {
-	usz total = properties_size(p, ctx)!;
-	if (self.remaining() < total) return mqtt::BUFFER_TOO_SMALL~;
-	Emit probe = {};
-	emit_body(&probe, p, ctx)!;
-	self.vbi((uint)probe.n)!;
+	usz body = properties_body_size(p, ctx)!;
+	usz prefix = wire::vbi_size((uint)body);
+	if (body > mqtt::MAX_REMAINING_LENGTH || prefix == 0) return mqtt::PACKET_TOO_LARGE~;
+	if (self.remaining() < prefix + body) return mqtt::BUFFER_TOO_SMALL~;
+	self.vbi((uint)body)!;
 	Emit e = { .w = self };
 	emit_body(&e, p, ctx)!;
 }
