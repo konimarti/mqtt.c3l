@@ -141,7 +141,7 @@ fn PropKind kind_of(char id)
 }
 
 // Which packets (and the Will block) may carry each property: [5.0 2.2.2.2] table, one bit per
-// PropContext (bit = 1 << context.ordinal). **verify** against the spec text before release.
+// PropContext (bit = 1 << context.ordinal). Checked against the table, property by property.
 struct PropRule
 {
 	char id;

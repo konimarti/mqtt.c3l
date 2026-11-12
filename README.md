@@ -6,7 +6,36 @@ MQTT 3.1.1 and 5.0 client for C3. One library, the protocol level is chosen when
 - A blocking client on top (`mqtt::client`) over a `Transport` (`read` and `write` with a timeout, `close`), with a TCP transport (`mqtt::tcp`).
 - The codec (`mqtt::packet`, `mqtt::props`, `mqtt::wire`), topic validation and matching (`mqtt::topic`).
 
+## Install
+
+`c3l add` with the repository URL of this library, or a git submodule in `lib/mqtt.c3l` and in your `project.json`:
+
+```json
+{ "dependency-search-paths": [ "lib" ], "dependencies": [ "mqtt" ] }
+```
+
 ## Client
+
+Publish one message (this is the whole program apart from the imports):
+
+```c3
+import mqtt, mqtt::client, mqtt::core, mqtt::tcp, mqtt::transport;
+import std::time;
+
+fn void? publish_once()
+{
+	TcpTransport t = tcp::connect("localhost", 1883, time::sec(5))!;
+	defer (void)t.close();
+	Config config = core::default_config(Version.V5, "sensor-1");
+	Client c;
+	defer c.close();
+	c.open(mem, (Transport)&t, &config, time::sec(5))!;
+	OutMessage m = { .topic = "plant/line1/temp", .payload = (char[])"21.5", .qos = QoS.AT_LEAST_ONCE };
+	c.publish_wait(&m, time::sec(5))!;
+}
+```
+
+Publish, subscribe and receive:
 
 ```c3
 import mqtt, mqtt::client, mqtt::core, mqtt::tcp, mqtt::transport;
@@ -66,12 +95,40 @@ Every blocking call takes a `Duration`. There is no "forever" constant: pass a v
 A zero timeout polls once. `Client.reconnect` connects again on a new transport and keeps the session (messages that were not
 finished are sent again); `open` starts a new one.
 
+## Core (sans-IO)
+
+`Core` does no I/O and never reads a clock: you move the bytes and tell it the time (a monotonic `Duration`). Use it to put the
+library on another kind of transport or event loop.
+
+```c3
+import mqtt, mqtt::core;
+import std::time;
+
+fn void? step(Allocator allocator, Core* core, Duration now, char[] from_network)
+{
+	// once: Config config = core::default_config(Version.V5, "sensor-1"); core.init(allocator, &config)!; core.connect(now)!;
+	core.input(now, from_network)!;                      // bytes you read from the socket (at most core.input_room())
+	Event ev;
+	while (core.poll_event(&ev))
+	{
+		if (ev.kind == EventKind.MESSAGE) { /* ev.message.topic, ev.message.payload: valid until the next input */ }
+	}
+	Duration due;
+	if (core.next_deadline(&due) && due <= now) core.timeout(now)!;   // keep alive, ping timeout
+	char[] out = core.pending_output();                  // write these bytes to the socket,
+	core.output_done(out.len);                           // then say how many went out
+}
+```
+
 ## Notes
 
-- Subscriptions are not tracked: after a session was lost (`session_present` is false) subscribe again.
+- Resubscribe after session loss: subscriptions are not tracked. When the CONNACK says `session_present` is false (the server
+  has no session for the client: it was lost, expired, or `clean_start` was set) subscribe again; the messages in flight that
+  were not finished are reported with `PUBLISH_DONE` and an error reason (see below).
 - Messages of QoS 1 and 2 that were not finished are kept across reconnects and sent again (5.0: while the session lives);
   without a stored session they are reported with `PUBLISH_DONE` and an error reason.
-- Large retained messages need a bigger `max_packet_size` in the `Config` (default 256 KiB).
+- Large retained messages need a bigger `max_packet_size` in the `Config` (default 256 KiB): a retained message that is
+  larger is a protocol error for the client and ends the connection, every time it is delivered.
 
 ## mqttc
 
@@ -135,3 +192,30 @@ library:
   `t` reaches it, which is what the library assumes.
 - The will is delivered when the client's connection is dropped without DISCONNECT; the QoS 2 flows, retained messages and the wildcard rules
   (`#` does not match a topic that starts with `$`) match the specification.
+
+## Tests
+
+`c3c test` runs the unit tests: codec fixtures written from the specification, scripted sessions of the core with a virtual
+clock, mutation fuzzing of the codec and the core, the blocking client over an in-memory transport and over loopback sockets.
+No broker, no network apart from loopback. Leaks are checked with a tracking allocator.
+
+## Out of scope
+
+A broker; WebSocket; storing the session on disk (a restart loses QoS 1 and 2 messages in flight); TLS (a separate library that
+implements the same `Transport` shape); automatic reconnect with back-off; threads and an event-loop adapter; SASL mechanisms
+(an `AuthHook` is the extension point); MQTT-SN; request/response helpers; Sparkplug.
+
+## Known gaps
+
+- Windows and macOS are only type-checked locally; the socket tests run there for the first time in CI.
+- AddressSanitizer could not run in the development box; CI runs it on Linux.
+- The scenarios against mosquitto and the hex fixtures recorded from a broker are still to be done; only the Paho
+  interoperability broker has been run. The scenarios that need a broker with persistence (broker killed in the middle of a
+  QoS 2 flow) and with user names and passwords are skipped.
+- After a lost session, messages of QoS 1 and 2 in flight are reported and dropped, not queued again.
+- The connection is serviced (keep alive, ping timeout) only while a call of the client runs.
+
+## Licence
+
+MIT (see `LICENSE`). The Eclipse Paho interoperability broker and mosquitto (both under the Eclipse licences) are only
+run as separate programs by the peer tests; nothing of them is copied into this repository.
