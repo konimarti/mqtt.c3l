@@ -346,3 +346,69 @@ fn void client_huge_timeout_does_not_wrap() @test
 	assert(!c.next(&ev, (Duration)-5)!!);
 	c.close();
 }
+
+// ---- memory and reconnecting ----
+
+fn void client_open_again_and_close_leave_nothing_allocated() @test
+{
+	TrackingAllocator t;
+	t.init(mem);
+	Script s;
+	Client c;
+	Config cf = cfg();
+	s.on_write(0x10, "20 02 00 00");
+	c.use_clock(&script_clock, &s);
+	c.open(&t, (Transport)&s, &cf, time::sec(5))!!;
+	// a second open starts a new session: the first core is released, not leaked
+	Script s2;
+	s2.on_write(0x10, "20 02 00 00");
+	c.use_clock(&script_clock, &s2);
+	c.open(&t, (Transport)&s2, &cf, time::sec(5))!!;
+	c.close();
+	assert(t.allocation_count() == 0, "nothing left after open twice and close");
+	// a failed attempt (no CONNACK) and a configuration the core refuses
+	Script s3;
+	Client d;
+	d.use_clock(&script_clock, &s3);
+	assert(@catch(d.open(&t, (Transport)&s3, &cf, time::ms(100))) == mqtt::TIMEOUT);
+	d.close();
+	Config bad = core::default_config(Version.V311, "");
+	bad.clean_start = false;                                  // an empty id needs a clean session
+	Client e;
+	assert(@catch(e.open(&t, (Transport)&s3, &bad, time::ms(100))) == mqtt::INVALID_ARGUMENT);
+	e.close();
+	assert(t.allocation_count() == 0, "nothing left after the failed attempts");
+	t.free();
+}
+
+fn void client_reconnect_keeps_the_session() @test
+{
+	TrackingAllocator t;
+	t.init(mem);
+	Script s;
+	Client c;
+	Config cf = cfg();
+	cf.clean_start = false;
+	s.on_write(0x10, "20 02 00 00");
+	c.use_clock(&script_clock, &s);
+	c.open(&t, (Transport)&s, &cf, time::sec(5))!!;
+	// a QoS 1 message that is never acknowledged, then the link breaks
+	OutMessage m = { .topic = "a/b", .payload = testutil::hex("68 69"), .qos = QoS.AT_LEAST_ONCE };
+	assert(c.publish(&m, time::sec(1))!! == 1);
+	s.eof = true;
+	Event ev;
+	assert(c.next(&ev, time::sec(1))!! && ev.kind == EventKind.CLOSED);
+	assert(c.core.inflight_count() == 1, "the message is still held");
+	// the same Client, a new link: session present, the message goes out again with DUP set
+	Script s2;
+	s2.on_write(0x10, "20 02 01 00");
+	c.use_clock(&script_clock, &s2);
+	c.reconnect((Transport)&s2, time::sec(5))!!;
+	assert(wrote(&s2, "3A 09 00 03 61 2F 62 00 01 68 69"), "resent in the original form, DUP set");
+	s2.add("40 02 00 01");
+	assert(c.next(&ev, time::sec(1))!!);
+	assert(ev.kind == EventKind.PUBLISH_DONE && ev.done.packet_id == 1);
+	c.close();
+	assert(t.allocation_count() == 0);
+	t.free();
+}

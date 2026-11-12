@@ -62,14 +62,41 @@ fn Duration Client.now(&self)
 // The Client does not own `transport` (the caller releases it); it does own `core`.
 fn void? Client.open(&self, Allocator allocator, Transport transport, Config* config, Duration timeout)
 {
+	// open starts a new session: what an earlier open left behind is released first
+	if (self.opened)
+	{
+		self.core.free();
+		self.opened = false;
+	}
 	self.allocator = allocator;
 	self.transport = transport;
 	self.origin = clock::now();
 	if (self.rbuf.len == 0) self.rbuf = alloc::alloc_array(allocator, char, (sz)READ_BUFFER_SIZE);
-	self.core.init(allocator, config)!;
+	if (catch err = self.core.init(allocator, config))
+	{
+		self.close();                                       // nothing was set up: give the read buffer back too
+		return err~;
+	}
 	self.opened = true;
 	Duration deadline = self.deadline_after(timeout);
 	self.core.connect(self.now())!;
+	return self.wait_connected(deadline);
+}
+
+// Connects again on a new transport with the session the core still holds (Config.clean_start false): messages
+// that were not finished are sent again, DUP set, in their original order, as far as the server's window allows.
+// Needs a Client that was opened and whose connection ended. Faults as open.
+fn void? Client.reconnect(&self, Transport transport, Duration timeout)
+{
+	if (!self.opened) return mqtt::NOT_CONNECTED~;
+	self.transport = transport;
+	Duration deadline = self.deadline_after(timeout);
+	self.core.connect(self.now())!;
+	return self.wait_connected(deadline);
+}
+
+fn void? Client.wait_connected(&self, Duration deadline)
+{
 	Event ev;
 	while (true)
 	{
@@ -195,7 +222,7 @@ fn void? Client.disconnect(&self, ReasonCode reason, Duration timeout)
 	if (failed) return failed~;
 }
 
-// ---- the connection loop ----
+// ---- the connection loop (internal: used by the calls above) ----
 
 // Writes what the core wants written. A write that fails may have left half a packet on the wire, so the link is
 // finished: the transport is closed and the core told.
