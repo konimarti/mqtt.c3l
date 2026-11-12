@@ -234,6 +234,7 @@ struct Core
 	bool reached_connected;         // the current connection got a CONNACK that accepted it
 	Limits limits;                  // negotiated by CONNACK
 	String assigned_id;             // owned copy of the server assigned client identifier
+	bool flow_stalled;              // resending or sending queued messages stopped: the output buffer is full
 	ulong[1024] id_used;            // bit per packet id: held by an inflight record or a pending request
 }
 
@@ -398,6 +399,9 @@ fn void Core.trim_for_server(&self, Packet* p)
 	pr.user_raw = {};
 }
 
+// Is there room in the output buffer for a packet of this size?
+fn bool Core.has_room(&self, usz size) => (usz)self.out_buf.len() + size <= self.config.effective_max_out_buffer();
+
 // Appends a packet to the output buffer; the limits of the buffer apply.
 fn void? Core.queue_packet(&self, Duration now, Packet* p)
 {
@@ -429,6 +433,19 @@ fn void Core.output_done(&self, usz n)
 		mem::move(self.out_buf.entries, self.out_buf.entries + n, (sz)(len - n));
 		self.out_buf.size -= (sz)n;
 	}
+	if (self.flow_stalled && self.state == State.CONNECTED)
+	{
+		// room again: the messages that waited for it go out now
+		self.flow_stalled = false;
+		if (catch err = self.resend_pending(self.last_now))
+		{
+			(void)self.fail(self.last_now, err);
+		}
+		else if (catch err2 = self.drain_queue(self.last_now))
+		{
+			(void)self.fail(self.last_now, err2);
+		}
+	}
 	if (self.state == State.DISCONNECTING && self.out_buf.len() == 0)
 	{
 		fault none;                                    // orderly: no fault
@@ -448,6 +465,7 @@ fn void? Core.connect(&self, Duration now)
 	self.in_buf.size = self.in_consumed;             // bytes of an earlier connection are void
 	self.clear_pending();
 	self.apply_session_rules(t);
+	self.flow_stalled = false;
 	self.closed_seen = false;
 	self.reached_connected = false;
 	self.ping_outstanding = false;
@@ -1165,6 +1183,11 @@ fn void? Core.resend_pending(&self, Duration now)
 		{
 			Packet rel = { .type = PacketType.PUBREL };
 			rel.ack.packet_id = r.id;
+			if (!self.has_room(packet::encoded_size(self.config.version, &rel)!))
+			{
+				self.flow_stalled = true;                      // back pressure: the rest follows when the buffer drained
+				break;
+			}
 			self.queue_packet(now, &rel)!;
 		}
 		else
@@ -1190,6 +1213,11 @@ fn void? Core.resend_pending(&self, Duration now)
 				self.inflight.remove_at(i);
 				self.drop_record(&dead, refused);
 				continue;
+			}
+			if (!self.has_room(packet::encoded_size(self.config.version, &p)!))
+			{
+				self.flow_stalled = true;
+				break;
 			}
 			self.queue_packet(now, &p)!;
 		}
@@ -1337,11 +1365,21 @@ fn void? Core.drain_queue(&self, Duration now)
 			self.events.push({ .kind = EventKind.PUBLISH_DONE, .reason = ReasonCode.UNSPECIFIED_ERROR });
 			continue;
 		}
+		// is there room for it in the output buffer? (the size does not depend on the id)
+		r.id = 1;
+		Packet p;
+		self.fill_publish(now, &r, false, &p)!;
+		if (!self.has_room(packet::encoded_size(self.config.version, &p)!))
+		{
+			self.flow_stalled = true;                      // back pressure: it stays queued
+			break;
+		}
 		ushort? id = self.alloc_id();
 		if (catch err = id) break;                        // all ids in use: it stays queued
 		r.id = id;
 		r.state = r.qos == QoS.AT_LEAST_ONCE ? InflightState.WAIT_PUBACK : InflightState.WAIT_PUBREC;
-		if (catch err = self.send_record(now, &r, false))
+		p.publish.packet_id = id;
+		if (catch err = self.queue_packet(now, &p))
 		{
 			self.release_id(id);
 			return err~;

@@ -608,3 +608,78 @@ fn void disconnect_expiry_check_uses_the_connect_value() @test
 	harness::expect_out(&t.core, "E0 07 00 05 11 00 00 00 1E");
 	t.close();
 }
+
+// ---- a full output buffer is back pressure, not an error ----
+
+fn OutMessage big_msg(QoS qos, char fill)
+{
+	char[] payload = mem::temp_array(char, 150);
+	payload[..] = fill;
+	return { .topic = "t", .payload = payload, .qos = qos };
+}
+
+fn void resend_waits_for_room_in_the_output_buffer() @test
+{
+	Session s;
+	Config c = cfg(Version.V5);
+	c.max_out_buffer = 400;
+	s.open(&c, CONNACK_5);
+	for (char i = 1; i <= 3; i++)
+	{
+		OutMessage m = big_msg(QoS.AT_LEAST_ONCE, i);
+		s.core.publish(s.clock.now, &m)!!;
+		s.core.output_done(s.core.pending_output().len);
+	}
+	lose(&s);
+	reconnect(&s, CONNACK_5_SESSION);
+	// room for two of the three: the third waits, the connection stays up
+	assert(s.core.state == State.CONNECTED, "the buffer being full does not end the connection");
+	ushort[] first = ids_of_publishes(s.core.pending_output());
+	assert(first.len == 2 && first[0] == 1 && first[1] == 2);
+	// once the transport has taken the bytes, the rest goes out
+	s.core.output_done(s.core.pending_output().len);
+	ushort[] rest = ids_of_publishes(s.core.pending_output());
+	assert(rest.len == 1 && rest[0] == 3);
+	s.core.output_done(s.core.pending_output().len);
+	s.close();
+}
+
+fn void queued_messages_wait_for_room_in_the_output_buffer() @test
+{
+	Session s;
+	Config c = cfg(Version.V5);
+	c.max_out_buffer = 200;
+	s.open(&c, "20 06 00 00 03 21 00 01");                       // window of 1
+	OutMessage a = big_msg(QoS.AT_LEAST_ONCE, 1);
+	OutMessage b = big_msg(QoS.AT_LEAST_ONCE, 2);
+	s.core.publish(s.clock.now, &a)!!;
+	assert(s.core.publish(s.clock.now, &b)!! == 0);
+	// the acknowledgement arrives while the first message is still in the buffer: no room for the second yet
+	harness::feed(&s.core, &s.clock, "40 02 00 01");
+	assert(s.core.state == State.CONNECTED);
+	assert(s.core.queued_count() == 1);
+	s.core.output_done(s.core.pending_output().len);
+	ushort[] sent = ids_of_publishes5(s.core.pending_output());
+	assert(sent.len == 1 && sent[0] == 2, "the queued message goes out when the buffer drained");
+	assert(s.core.queued_count() == 0);
+	s.core.output_done(s.core.pending_output().len);
+	s.close();
+}
+
+fn ushort[] ids_of_publishes5(char[] output)
+{
+	ushort[] ids = mem::temp_array(ushort, 16);
+	usz n;
+	char[] rest = output;
+	while (rest.len > 0)
+	{
+		usz len = packet::frame_length(rest, 0)!!;
+		if (rest[0] >> 4 == 3)
+		{
+			Packet p = packet::decode(Version.V5, rest[:len])!!;
+			ids[n++] = p.publish.packet_id;
+		}
+		rest = rest[len..];
+	}
+	return ids[:n];
+}
