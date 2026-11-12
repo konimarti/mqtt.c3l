@@ -730,6 +730,8 @@ fn void? Core.handle_connack(&self, Duration now, usz off, usz n, Packet* p)
 	}
 	// a server that reports a stored session after a clean start is broken
 	if (a.session_present && c.clean_start) return self.fail(now, mqtt::PROTOCOL_ERROR);
+	// a server may name only the authentication method we asked for [5.0 4.12]
+	if (a.props.has(PropId.AUTHENTICATION_METHOD) && (c.auth_method.len == 0 || a.props.auth_method != c.auth_method)) return self.fail(now, mqtt::PROTOCOL_ERROR);
 	Limits l;
 	l.keep_alive = c.keep_alive;
 	l.session_expiry = c.session_expiry;

@@ -306,3 +306,48 @@ fn void auth_method_on_311_invalid_argument() @test
 	assert(@catch(s.core.send_auth(s.clock.now, ReasonCode.RE_AUTHENTICATE, {})) == mqtt::INVALID_ARGUMENT);
 	s.close();
 }
+
+// ---- the CONNACK and the authentication method ----
+
+fn void connack_with_an_unasked_authentication_method() @test
+{
+	// we asked for no authentication: the server must not claim one
+	Session s;
+	Config c = core::default_config(Version.V5, "a");
+	s.mem_track.init(mem);
+	s.core.init(&s.mem_track, &c)!!;
+	s.core.connect(s.clock.now)!!;
+	s.core.output_done(s.core.pending_output().len);
+	char[] frame = testutil::hex("20 07 00 00 04 15 00 01 6D");
+	assert(@catch(s.core.input(s.clock.now, frame)) == mqtt::PROTOCOL_ERROR);
+	harness::expect_out(&s.core, "E0 01 82");
+	s.close();
+	// another method than ours
+	Session t;
+	Config d = cfg();
+	t.mem_track.init(mem);
+	t.core.init(&t.mem_track, &d)!!;
+	t.core.connect(t.clock.now)!!;
+	t.core.output_done(t.core.pending_output().len);
+	char[] other = testutil::hex("20 07 00 00 04 15 00 01 78");
+	assert(@catch(t.core.input(t.clock.now, other)) == mqtt::PROTOCOL_ERROR);
+	t.close();
+	// our method, or none at all, is fine
+	Session u;
+	Config e = cfg();
+	u.mem_track.init(mem);
+	u.core.init(&u.mem_track, &e)!!;
+	u.core.connect(u.clock.now)!!;
+	u.core.output_done(u.core.pending_output().len);
+	harness::feed(&u.core, &u.clock, "20 07 00 00 04 15 00 01 6D");
+	assert(u.take().kind == EventKind.CONNECTED);
+	u.close();
+	Session v;
+	v.mem_track.init(mem);
+	v.core.init(&v.mem_track, &e)!!;
+	v.core.connect(v.clock.now)!!;
+	v.core.output_done(v.core.pending_output().len);
+	harness::feed(&v.core, &v.clock, CONNACK_5);
+	assert(v.take().kind == EventKind.CONNECTED);
+	v.close();
+}
