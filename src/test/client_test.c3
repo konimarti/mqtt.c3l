@@ -324,3 +324,25 @@ fn void client_over_tcp_loopback() @test
 	assert(buf[:k] == testutil::hex("30 07 00 03 61 2F 62 68 69"));
 	c.close();
 }
+
+// ---- timeouts ----
+
+fn void client_huge_timeout_does_not_wrap() @test
+{
+	Script s;
+	Client c;
+	Config cf = cfg();
+	s.now = time::sec(100);                                   // the clock is well above zero
+	start(&c, &s, &cf);
+	Duration forever = (Duration)long::max;
+	s.add("30 07 00 03 61 2F 62 68 69");
+	Event ev;
+	assert(c.next(&ev, forever)!!, "a readable message is returned, not a wrapped deadline");
+	assert(ev.kind == EventKind.MESSAGE);
+	s.on_write(0x32, "40 02 00 01");
+	OutMessage m = { .topic = "a/b", .payload = testutil::hex("68 69"), .qos = QoS.AT_LEAST_ONCE };
+	assert(c.publish_wait(&m, forever)!! == ReasonCode.SUCCESS);
+	// a negative timeout means "now": one poll, no wait
+	assert(!c.next(&ev, (Duration)-5)!!);
+	c.close();
+}

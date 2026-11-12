@@ -38,6 +38,16 @@ fn void Client.use_clock(&self, ClockFn fn_, void* context)
 	self.clock_context = context;
 }
 
+// The moment `timeout` from now, without wrapping around: a huge Duration (there is no "forever" constant, pass a
+// very large one) means a deadline far away, and a negative one means "now".
+fn Duration Client.deadline_after(&self, Duration timeout)
+{
+	Duration now = self.now();
+	if (timeout <= time::DURATION_ZERO) return now;
+	Duration room = (Duration)long::max - now;
+	return timeout >= room ? (Duration)long::max : now + timeout;
+}
+
 // The time handed to the core.
 fn Duration Client.now(&self)
 {
@@ -58,7 +68,7 @@ fn void? Client.open(&self, Allocator allocator, Transport transport, Config* co
 	if (self.rbuf.len == 0) self.rbuf = alloc::alloc_array(allocator, char, (sz)READ_BUFFER_SIZE);
 	self.core.init(allocator, config)!;
 	self.opened = true;
-	Duration deadline = self.now() + timeout;
+	Duration deadline = self.deadline_after(timeout);
 	self.core.connect(self.now())!;
 	Event ev;
 	while (true)
@@ -87,7 +97,7 @@ fn void Client.close(&self)
 // waited in the core's queue: the call then runs the connection until it was sent, and returns the id it got.
 fn ushort? Client.publish(&self, OutMessage* msg, Duration timeout)
 {
-	Duration deadline = self.now() + timeout;
+	Duration deadline = self.deadline_after(timeout);
 	ushort id = self.core.publish(self.now(), msg)!;
 	if (msg.qos != QoS.AT_MOST_ONCE && id == 0)
 	{
@@ -102,7 +112,7 @@ fn ushort? Client.publish(&self, OutMessage* msg, Duration timeout)
 // events stay queued.
 fn ReasonCode? Client.wait_done(&self, ushort id, Duration timeout)
 {
-	Duration deadline = self.now() + timeout;
+	Duration deadline = self.deadline_after(timeout);
 	Event ev;
 	while (true)
 	{
@@ -114,7 +124,7 @@ fn ReasonCode? Client.wait_done(&self, ushort id, Duration timeout)
 // publish and wait_done in one. QoS 0 has nothing to wait for: SUCCESS once it was written.
 fn ReasonCode? Client.publish_wait(&self, OutMessage* msg, Duration timeout)
 {
-	Duration deadline = self.now() + timeout;
+	Duration deadline = self.deadline_after(timeout);
 	ushort id = self.publish(msg, timeout)!;
 	if (msg.qos == QoS.AT_MOST_ONCE) return ReasonCode.SUCCESS;
 	return self.wait_done(id, deadline - self.now());
@@ -124,14 +134,14 @@ fn ReasonCode? Client.publish_wait(&self, OutMessage* msg, Duration timeout)
 // many filters were answered.
 fn usz? Client.subscribe(&self, SubEntry[] entries, char[] codes_out, Duration timeout)
 {
-	Duration deadline = self.now() + timeout;
+	Duration deadline = self.deadline_after(timeout);
 	ushort id = self.core.subscribe(self.now(), entries, null)!;
 	return self.wait_answer(EventKind.SUBSCRIBED, id, codes_out, deadline);
 }
 
 fn usz? Client.unsubscribe(&self, String[] filters, char[] codes_out, Duration timeout)
 {
-	Duration deadline = self.now() + timeout;
+	Duration deadline = self.deadline_after(timeout);
 	ushort id = self.core.unsubscribe(self.now(), filters, null)!;
 	return self.wait_answer(EventKind.UNSUBSCRIBED, id, codes_out, deadline);
 }
@@ -157,7 +167,7 @@ fn usz? Client.wait_answer(&self, EventKind kind, ushort id, char[] codes_out, D
 // call after it faults with NOT_CONNECTED.
 fn bool? Client.next(&self, Event* ev, Duration timeout)
 {
-	Duration deadline = self.now() + timeout;
+	Duration deadline = self.deadline_after(timeout);
 	while (true)
 	{
 		if (self.core.poll_event(ev)) return true;
@@ -176,7 +186,7 @@ fn bool? Client.next(&self, Event* ev, Duration timeout)
 // Sends DISCONNECT, writes it, closes the transport and tells the core. The CLOSED event can be read with next.
 fn void? Client.disconnect(&self, ReasonCode reason, Duration timeout)
 {
-	Duration deadline = self.now() + timeout;
+	Duration deadline = self.deadline_after(timeout);
 	self.core.disconnect(self.now(), reason, null)!;
 	fault failed;
 	if (catch err = self.flush(deadline)) failed = err;
