@@ -876,6 +876,16 @@ fn bool Core.poll_matching(&self, EventKind kind, ushort id, Event* ev)
 	return false;
 }
 
+// Takes the message that was queued last out of the queue again (it was never sent). False if the queue is empty.
+fn bool Core.cancel_last_queued(&self)
+{
+	if (self.queue.len() == 0) return false;
+	Inflight r = self.queue.entries[self.queue.len() - 1];
+	self.queue.remove_at(self.queue.len() - 1);
+	self.free_block(&r);
+	return true;
+}
+
 // The packet id of the record that was sent last (0 if nothing is in flight).
 fn ushort Core.last_inflight_id(&self)
 {

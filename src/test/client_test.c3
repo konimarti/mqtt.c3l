@@ -452,3 +452,46 @@ fn void client_next_reports_a_write_timeout_as_the_end_of_the_link() @test
 	assert(closed && s.closed && c.core.state == State.DISCONNECTED, "not reported as 'nothing came'");
 	c.close();
 }
+
+// ---- a publish that times out while it waits for the window ----
+
+fn void client_publish_timeout_while_queued_does_not_send_later() @test
+{
+	Script s;
+	Client c;
+	Config cf = core::default_config(Version.V5, "a");
+	s.on_write(0x10, "20 06 00 00 03 21 00 01");            // Receive Maximum 1
+	c.use_clock(&script_clock, &s);
+	c.open(mem, (Transport)&s, &cf, time::sec(5))!!;
+	OutMessage a = { .topic = "a", .payload = testutil::hex("01"), .qos = QoS.AT_LEAST_ONCE };
+	assert(c.publish(&a, time::sec(1))!! == 1);
+	OutMessage b = { .topic = "b", .payload = testutil::hex("02"), .qos = QoS.AT_LEAST_ONCE };
+	assert(@catch(c.publish(&b, time::ms(200))) == mqtt::TIMEOUT);
+	assert(c.core.queued_count() == 0, "a message the caller was told about is not kept for later");
+	// the PUBACK of the first one arrives: nothing is sent for the second
+	usz before = s.out_len;
+	s.add("40 02 00 01");
+	Event ev;
+	assert(c.next(&ev, time::ms(100))!! && ev.kind == EventKind.PUBLISH_DONE);
+	assert(s.out_len == before, "the timed out message was not sent");
+	c.close();
+}
+
+// the window-full path of publish: it runs the connection until the message went out and returns its id
+fn void client_publish_waits_for_the_window() @test
+{
+	Script s;
+	Client c;
+	Config cf = core::default_config(Version.V5, "a");
+	s.on_write(0x10, "20 06 00 00 03 21 00 01");
+	c.use_clock(&script_clock, &s);
+	c.open(mem, (Transport)&s, &cf, time::sec(5))!!;
+	OutMessage a = { .topic = "a", .payload = testutil::hex("01"), .qos = QoS.AT_LEAST_ONCE };
+	assert(c.publish(&a, time::sec(1))!! == 1);
+	OutMessage b = { .topic = "b", .payload = testutil::hex("02"), .qos = QoS.AT_LEAST_ONCE };
+	// the server acknowledges the first message: the second one is sent and gets the next id
+	s.add("40 02 00 01");
+	assert(c.publish(&b, time::sec(1))!! == 2);
+	assert(wrote(&s, "32 07 00 01 62 00 02 00 02"));
+	c.close();
+}

@@ -122,14 +122,25 @@ fn void Client.close(&self)
 
 // Sends a message. QoS 0 returns 0 once the bytes were written; QoS 1 and 2 return the packet id (the message is
 // written; completion comes with PUBLISH_DONE, see wait_done). When the server's window was full the message
-// waited in the core's queue: the call then runs the connection until it was sent, and returns the id it got.
+// waits in the core's queue: the call then runs the connection until it was sent, and returns the id it got.
+// TIMEOUT (or any other fault) while it waits means it was not sent and is not kept either: retrying is safe.
 fn ushort? Client.publish(&self, OutMessage* msg, Duration timeout)
 {
 	Duration deadline = self.deadline_after(timeout);
 	ushort id = self.core.publish(self.now(), msg)!;
 	if (msg.qos != QoS.AT_MOST_ONCE && id == 0)
 	{
-		while (self.core.queued_count() > 0) self.pump(deadline)!;
+		// the window was full: run the connection until the message went out
+		while (self.core.queued_count() > 0)
+		{
+			if (catch err = self.pump(deadline))
+			{
+				if (self.core.queued_count() == 0) break;
+				// not sent: it does not stay in the queue, so a retry after TIMEOUT cannot send it twice
+				(void)self.core.cancel_last_queued();
+				return err~;
+			}
+		}
 		id = self.core.last_inflight_id();
 	}
 	self.flush(deadline)!;
