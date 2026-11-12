@@ -101,3 +101,37 @@ build/mqttc sub -h localhost -t 'plant/#' -q 1 -c 10
 - Exit codes: 0 done, 1 a runtime error (connection, refusal, timeout), 2 a command line error. `-v` reports progress on stderr.
   `build/mqttc` without arguments prints the usage.
 
+
+## Running the peer tests
+
+`build/itest` runs scenarios against a live broker and prints `PASS name`, `FAIL name reason` or `SKIP name reason` (the exit code is the
+number of failures; a scenario the broker cannot do is a SKIP with the reason, never silent). `tools/peer.py` (Python 3, standard
+library only) starts a broker for each group of scenarios (`basic`, `limits`, `sessions`) with the limits that group needs, runs
+`itest` and stops the broker, also on Ctrl-C and on a timeout:
+
+```sh
+c3c build itest
+python3 tools/peer.py --kind paho --version 3.1.1
+python3 tools/peer.py --kind paho --version 5 --group limits
+```
+
+The broker command comes from the kind, or from `MQTT_PEER_CMD` (a command line with `{config}` and `{port}`); `MQTT_PEER_PORT` fixes the
+port. `itest` itself reads `MQTT_PEER=host:port` and `MQTT_PEER_KIND`, so it can be pointed at any broker by hand.
+The `paho` kind needs the Eclipse Paho interoperability test broker (Python) checked out in `.work/peer/paho`; nothing is installed.
+The unit tests (`c3c test`) need no broker.
+
+### Interop notes
+
+Observed with the Paho interoperability broker (3.1.1 and 5.0 on one port); no difference between it and the library called for a change in the
+library:
+
+- Receive Maximum, Maximum Packet Size and Topic Alias Maximum from the configuration are announced in the CONNACK and kept by the
+  broker; the library never has more than Receive Maximum messages unacknowledged and refuses a larger packet locally.
+- The broker ignores the settings for Maximum QoS and Retain Available and does not announce them. The scenarios that need them are skipped.
+- It has no user name and password support (the authentication scenario is skipped) and keeps no sessions over a restart, so the
+  "broker killed in the middle of a QoS 2 flow" scenario is skipped. Sessions that the broker keeps while it runs (offline queue, takeover with
+  reason 0x8E, expiry interval, shared subscriptions, No Local, Retain As Published, Retain Handling 0/1/2) behave as the specification says.
+- A `$share/g/t` filter on a 3.1.1 connection is an ordinary filter to the broker: it is granted (QoS 1) and nothing published to
+  `t` reaches it, which is what the library assumes.
+- The will is delivered when the client's connection is dropped without DISCONNECT; the QoS 2 flows, retained messages and the wildcard rules
+  (`#` does not match a topic that starts with `$`) match the specification.
