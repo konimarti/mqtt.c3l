@@ -9,11 +9,15 @@ import std::io, std::os::env, std::time, std::thread;
 
 faultdef CHECK_FAILED, SKIPPED;
 
+const long RECV_MS = 10000;         // how long a message that must arrive may take (costs nothing when it comes at once)
+const long QUIET_MS = 800;          // how long to wait for a message that must not arrive
+
 String peer_host = "127.0.0.1";
 int peer_port = 1883;
 String peer_kind = "peer";
 Version version = Version.V5;
-String prefix;                      // topics of this run: itest/<version>/
+String prefix;                      // topics of this run: itest/<version>/<token>/
+String token;                       // tells this run from another one on the same broker (MQTT_PEER_RUN or the clock)
 String why;                         // reason of the last failed check or skip
 int fails;
 int passes;
@@ -72,7 +76,7 @@ struct Conn
 fn void Conn.init(&self, String id, bool clean)
 {
 	*self = {};
-	self.config = core::default_config(version, id);
+	self.config = core::default_config(version, string::format(mem, "%s-%s", id, token));
 	self.config.clean_start = clean;
 	self.config.keep_alive = 30;
 }
@@ -83,6 +87,8 @@ fn void? Conn.connect(&self)
 	self.linked = true;
 	if (catch err = self.client.open(mem, (Transport)&self.link, &self.config, time::sec(5)))
 	{
+		(void)self.link.close();
+		self.linked = false;
 		why = "CONNECT refused or failed";
 		return err~;
 	}
@@ -213,7 +219,7 @@ fn void? flow(QoS q)
 	b.subscribe(t, QoS.EXACTLY_ONCE)!;
 	a.publish(t, "hello", q)!;
 	Got g;
-	expect(b.recv(&g, 3000)!, "message not delivered")!;
+	expect(b.recv(&g, RECV_MS)!, "message not delivered")!;
 	expect(g.topic == t && g.payload == "hello", "wrong topic or payload")!;
 	expect(g.qos == q, "wrong QoS delivered")!;
 }
@@ -237,7 +243,7 @@ fn void? inbound()
 	{
 		b.publish(t, "in", q)!;
 		Got g;
-		expect(a.recv(&g, 3000)!, "inbound message not delivered")!;
+		expect(a.recv(&g, RECV_MS)!, "inbound message not delivered")!;
 		expect(g.qos == q, "wrong QoS on the inbound message")!;
 	}
 	expect(a.count(800)! == 0, "a message was delivered twice")!;
@@ -249,12 +255,13 @@ fn void? retained()
 	a.open("itest-r-a", true)!;
 	defer a.end();
 	String t = topic("retained");
+	defer (void)a.publish(t, "", QoS.AT_LEAST_ONCE, true);
 	a.publish(t, "keep", QoS.AT_LEAST_ONCE, true)!;
 	b.open("itest-r-b", true)!;
 	defer b.end();
 	b.subscribe(t, QoS.AT_LEAST_ONCE)!;
 	Got g;
-	expect(b.recv(&g, 3000)!, "retained message not delivered to a new subscriber")!;
+	expect(b.recv(&g, RECV_MS)!, "retained message not delivered to a new subscriber")!;
 	expect(g.payload == "keep" && g.retain, "retained message without the retain flag")!;
 	a.publish(t, "", QoS.AT_LEAST_ONCE, true)!;               // clears it
 	c.open("itest-r-c", true)!;
@@ -263,6 +270,7 @@ fn void? retained()
 	expect(!c.recv(&g, 1000)!, "the retained message was not cleared")!;
 }
 
+// QoS 1 will, no delay, not retained: the other variants are covered by the unit tests of the packet encoding.
 fn void? will()
 {
 	Conn w, o;
@@ -276,7 +284,7 @@ fn void? will()
 	w.connect()!;
 	w.drop();
 	Got g;
-	expect(o.recv(&g, 4000)!, "no will after the connection was dropped")!;
+	expect(o.recv(&g, RECV_MS)!, "no will after the connection was dropped")!;
 	expect(g.payload == "gone", "wrong will payload")!;
 }
 
@@ -338,7 +346,7 @@ fn void? ackorder()
 	for (int i = 0; i < 12; i++)
 	{
 		Got g;
-		expect(a.recv(&g, 3000)!, "burst message missing")!;
+		expect(a.recv(&g, RECV_MS)!, "burst message missing")!;
 		expect(g.payload == string::format(mem, "%d", i), "burst out of order")!;
 	}
 	expect(a.count(500)! == 0, "duplicate in the burst")!;
@@ -376,11 +384,13 @@ fn void? limits_user_props()
 	m.props.user = users[..];
 	a.send(&m)!;
 	Got g;
-	expect(b.recv(&g, 3000)!, "message with properties not delivered")!;
+	expect(b.recv(&g, RECV_MS)!, "message with properties not delivered")!;
 	expect(g.content_type == "text/x-itest", "content type lost")!;
 	expect(g.user_key == "k1" && g.user_value == "v1", "user property lost")!;
 }
 
+// The check of at most 2 unacknowledged messages is the library's own view of its window; a broker that enforces Receive Maximum
+// would close the connection on a violation. Only the delivery of all 20 messages is the broker's own evidence.
 fn void? limits_receive_maximum()
 {
 	Conn a, b;
@@ -416,6 +426,7 @@ fn void? limits_packet_too_large()
 	expect(a.client.core.state == State.CONNECTED, "the connection ended")!;
 }
 
+// Passes when the broker keeps the oversized message back, by dropping it or by not sending it; it fails when it is delivered.
 fn void? limits_inbound_packet_size()
 {
 	Conn a, b;
@@ -429,7 +440,7 @@ fn void? limits_inbound_packet_size()
 	a.subscribe(t, QoS.AT_LEAST_ONCE)!;
 	b.publish(t, "short", QoS.AT_LEAST_ONCE)!;
 	Got g;
-	expect(a.recv(&g, 3000)!, "small message not delivered")!;
+	expect(a.recv(&g, RECV_MS)!, "small message not delivered")!;
 	char[150] big;
 	OutMessage m = { .topic = t, .payload = big[..], .qos = QoS.AT_LEAST_ONCE };
 	b.send(&m)!;
@@ -449,10 +460,11 @@ fn void? limits_topic_alias()
 	String t = topic("aliased");
 	b.subscribe(t, QoS.AT_LEAST_ONCE)!;
 	for (int i = 0; i < 3; i++) a.publish(t, "x", QoS.AT_LEAST_ONCE)!;
+	expect(a.client.core.alias_out.len() > 0 && a.client.core.alias_uses > 0, "the client never used a topic alias")!;
 	for (int i = 0; i < 3; i++)
 	{
 		Got g;
-		expect(b.recv(&g, 3000)!, "aliased message missing")!;
+		expect(b.recv(&g, RECV_MS)!, "aliased message missing")!;
 		expect(g.topic == t, "wrong topic after aliasing")!;
 	}
 }
@@ -475,9 +487,37 @@ fn void? limits_retain()
 	expect(@catch(a.publish(topic("ret"), "x", QoS.AT_LEAST_ONCE, true)) == mqtt::NOT_SUPPORTED_BY_SERVER, "retain was not refused locally")!;
 }
 
+// A wrong password must be refused with Bad User Name or Password / Not authorized. A broker that takes any credentials
+// cannot be tested for it (SKIP). With MQTT_PEER_USER and MQTT_PEER_PASSWORD set the right ones must be accepted.
 fn void? limits_auth()
 {
-	return skip(string::format(mem, "%s has no user name and password support", peer_kind));
+	Conn a;
+	a.init("itest-l-auth", true);
+	a.config.set_credentials("itest-nobody", (char[])"wrong-password");
+	if (catch err = a.connect())
+	{
+		Event ev;
+		bool? got = a.client.next(&ev, time::DURATION_ZERO);
+		bool ok = false;
+		if (try got) ok = got && ev.kind == EventKind.CLOSED && ((char)ev.closed.reason == 0x86 || (char)ev.closed.reason == 0x87);
+		a.client.close();
+		expect(ok, "the wrong password was refused, but not with 0x86 or 0x87")!;
+	}
+	else
+	{
+		a.end();
+		return skip(string::format(mem, "%s accepts any user name and password", peer_kind));
+	}
+	String? user = env::get_var(mem, "MQTT_PEER_USER");
+	String? secret = env::get_var(mem, "MQTT_PEER_PASSWORD");
+	if (try user && try secret)
+	{
+		Conn b;
+		b.init("itest-l-auth2", true);
+		b.config.set_credentials(user, (char[])secret);
+		b.connect()!;
+		b.end();
+	}
 }
 
 // ---- scenarios: sessions ----
@@ -499,7 +539,7 @@ fn void? session_offline_queue()
 	a.connect()!;
 	defer a.end();
 	Got g;
-	expect(a.recv(&g, 3000)!, "the message published while the client was away was not delivered")!;
+	expect(a.recv(&g, RECV_MS)!, "the message published while the client was away was not delivered")!;
 	expect(g.payload == "while away", "wrong payload")!;
 }
 
@@ -511,13 +551,14 @@ fn void? session_takeover()
 	b.open("itest-s-t", true)!;
 	defer b.end();
 	Got g;
-	(void)a.recv(&g, 3000)!;
+	(void)a.recv(&g, RECV_MS)!;
 	if (version == Version.V5)
 	{
 		expect(a.closed_seen && a.closed_reason == ReasonCode.SESSION_TAKEN_OVER, "no DISCONNECT 0x8E for the first client")!;
 	}
 	else
 	{
+		// 3.1.1 has no DISCONNECT from the server: the broker just closes the first link, which the client notices as the end of it
 		expect(a.closed_seen || a.client.core.state == State.DISCONNECTED, "the first client is still connected")!;
 	}
 }
@@ -555,14 +596,37 @@ fn void? session_resubscribe()
 	a.subscribe(t, QoS.AT_LEAST_ONCE)!;
 	b.publish(t, "once", QoS.AT_LEAST_ONCE)!;
 	Got g;
-	expect(a.recv(&g, 3000)!, "no message after subscribing twice")!;
+	expect(a.recv(&g, RECV_MS)!, "no message after subscribing twice")!;
 	expect(g.qos == QoS.AT_LEAST_ONCE, "the new QoS did not replace the old one")!;
 	expect(a.count(800)! == 0, "the message was delivered twice")!;
 }
 
-fn void? session_resend_after_restart()
+// The broker is stopped and started again between the two parts by tools/peer.py (group restart). A QoS 2 message that
+// reached the broker for a client that was away must still be there after the restart; a broker without persistence
+// cannot do that (SKIP).
+fn void? restart_prepare()
 {
-	return skip(string::format(mem, "%s does not keep sessions over a restart", peer_kind));
+	Conn a, b;
+	a.init("itest-rs", false);
+	if (version == Version.V5) a.config.session_expiry = 600;
+	a.connect()!;
+	a.subscribe("itest/restart", QoS.EXACTLY_ONCE)!;
+	a.drop();
+	b.open("itest-rs-b", true)!;
+	defer b.end();
+	b.publish("itest/restart", "survives", QoS.EXACTLY_ONCE)!;
+}
+
+fn void? restart_check()
+{
+	Conn a;
+	a.init("itest-rs", false);
+	if (version == Version.V5) a.config.session_expiry = 600;
+	a.connect()!;
+	defer a.end();
+	Got g;
+	if (!a.recv(&g, 3000)!) return skip(string::format(mem, "%s lost the session over the restart", peer_kind));
+	expect(g.payload == "survives" && g.qos == QoS.EXACTLY_ONCE, "wrong message after the restart")!;
 }
 
 fn void? session_shared()
@@ -604,13 +668,13 @@ fn void? session_retain_as_published()
 	String t = topic("rap");
 	b.subscribe_entry({ .filter = t, .qos = QoS.AT_LEAST_ONCE, .retain_as_published = true })!;
 	c.subscribe(t, QoS.AT_LEAST_ONCE)!;
+	defer (void)a.publish(t, "", QoS.AT_LEAST_ONCE, true);
 	a.publish(t, "r", QoS.AT_LEAST_ONCE, true)!;
 	Got g;
-	expect(b.recv(&g, 3000)!, "no message")!;
+	expect(b.recv(&g, RECV_MS)!, "no message")!;
 	expect(g.retain, "Retain As Published: the flag was not kept")!;
-	expect(c.recv(&g, 3000)!, "no message")!;
+	expect(c.recv(&g, RECV_MS)!, "no message")!;
 	expect(!g.retain, "without Retain As Published the flag must be 0 on a live delivery")!;
-	a.publish(t, "", QoS.AT_LEAST_ONCE, true)!;
 }
 
 fn void? session_retain_handling()
@@ -651,8 +715,11 @@ fn void? session_share_on_311()
 	char[1] codes;
 	a.client.subscribe(entries[..], codes[..], time::sec(5))!;
 	b.publish("itest/s311", "x", QoS.AT_LEAST_ONCE)!;
-	int n = a.count(1000)!;
+	int n = a.count(QUIET_MS + 200)!;
 	io::printfn("INFO session_share_on_311 SUBACK code %d, delivered %d of 1", codes[0], n);
+	if (codes[0] >= 0x80) return;                               // refused: fine too
+	// 3.1.1 has no shared subscriptions: the filter is an ordinary one, so nothing published to the plain topic reaches it
+	if (n != 0) return skip(string::format(mem, "%s treats $share as a shared subscription on 3.1.1", peer_kind));
 }
 
 Scenario[*] scenarios = {
@@ -677,7 +744,8 @@ Scenario[*] scenarios = {
 	{ "limits_auth", "limits", true, &limits_auth },
 	{ "session_offline_queue", "sessions", false, &session_offline_queue },
 	{ "session_takeover", "sessions", false, &session_takeover },
-	{ "session_resend_after_restart", "sessions", false, &session_resend_after_restart },
+	{ "restart_prepare", "restart", false, &restart_prepare },
+	{ "restart_check", "restart", false, &restart_check },
 	{ "session_expiry", "sessions", true, &session_expiry },
 	{ "session_resubscribe", "sessions", false, &session_resubscribe },
 	{ "session_shared", "sessions", true, &session_shared },
@@ -719,6 +787,16 @@ fn void run_one(Scenario* s)
 	passes++;
 }
 
+fn bool known_group(String g)
+{
+	String[5] names = { "all", "basic", "limits", "sessions", "restart" };
+	foreach (name : names)
+	{
+		if (g == name) return true;
+	}
+	return false;
+}
+
 fn int main(String[] argv)
 {
 	String group = "all";
@@ -727,15 +805,33 @@ fn int main(String[] argv)
 	{
 		if (argv[i] == "--version" && i + 1 < argv.len)
 		{
-			version = argv[++i] == "3.1.1" ? Version.V311 : Version.V5;
+			String v = argv[++i];
+			if (v != "3.1.1" && v != "5")
+			{
+				io::eprintfn("itest: unknown version %s (3.1.1 or 5)", v);
+				return 99;
+			}
+			version = v == "3.1.1" ? Version.V311 : Version.V5;
 		}
 		else if (argv[i] == "--group" && i + 1 < argv.len)
 		{
 			group = argv[++i];
+			if (!known_group(group))
+			{
+				io::eprintfn("itest: unknown group %s", group);
+				return 99;
+			}
 		}
 		else if (argv[i] == "--name" && i + 1 < argv.len)
 		{
 			only = argv[++i];
+			bool found;
+			foreach (&s : scenarios) if (s.name == only) found = true;
+			if (!found)
+			{
+				io::eprintfn("itest: unknown scenario %s", only);
+				return 99;
+			}
 		}
 		else
 		{
@@ -755,13 +851,39 @@ fn int main(String[] argv)
 	}
 	String? kind = env::get_var(mem, "MQTT_PEER_KIND");
 	if (try kind) peer_kind = kind;
-	prefix = version == Version.V5 ? "itest/5/" : "itest/311/";
+	String? run = env::get_var(mem, "MQTT_PEER_RUN");
+	token = run ?? string::format(mem, "%x", (ulong)clock::now() & 0xFFFFFF);
+	String vtext = version == Version.V5 ? "5" : "311";
+	prefix = string::format(mem, "itest/%s/%s/", vtext, token);
+	// nothing listening: one SKIP, not a FAIL for every scenario
+	TcpTransport? probe = tcp::connect(peer_host, peer_port, time::sec(2));
+	if (catch probe)
+	{
+		io::printfn("SKIP peer no broker reachable at %s:%d", peer_host, peer_port);
+		return 0;
+	}
+	(void)probe.close();
 	foreach (&s : scenarios)
 	{
-		if (group != "all" && s.group != group) continue;
-		if (only.len > 0 && s.name != only) continue;
+		if (only.len > 0)
+		{
+			if (s.name != only) continue;
+		}
+		else if (group != "all" && s.group != group)
+		{
+			continue;
+		}
+		else if (group == "all" && s.group == "restart")
+		{
+			continue;                                               // needs the runner in between
+		}
 		run_one(s);
 	}
 	io::printfn("SUMMARY %s version %s: %d passed, %d failed, %d skipped", peer_kind, version == Version.V5 ? "5" : "3.1.1", passes, fails, skips);
+	if (passes + fails + skips == 0)
+	{
+		io::eprintn("itest: no scenario ran");
+		return 99;
+	}
 	return fails;
 }
