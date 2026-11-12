@@ -4,8 +4,19 @@ module mqtt::redirect;
 // "host", "host:port", "[ipv6]:port" (or "[ipv6]"), or a list of those separated by spaces; the first one is
 // used. host borrows from `reference`; port is default_port when the reference names none.
 // Returns false for anything else (an empty host, a port that is not 1..65535, an IPv6 address without
-// brackets, an unterminated bracket).
+// brackets, an unterminated bracket, a space-less control character). host and port are written only when the
+// reference was accepted.
 fn bool parse_server_reference(String reference, String* host, int* port, int default_port)
+{
+	String h;
+	int p;
+	if (!parse_first(reference, &h, &p, default_port)) return false;
+	*host = h;
+	*port = p;
+	return true;
+}
+
+fn bool parse_first(String reference, String* host, int* port, int default_port) @private
 {
 	usz start;
 	while (start < reference.len && reference[start] == ' ') start++;
@@ -30,6 +41,7 @@ fn bool parse_server_reference(String reference, String* host, int* port, int de
 		}
 		if (!found || close == 1) return false;
 		*host = first[1:close - 1];
+		if (!plain(*host)) return false;
 		rest = first[close + 1..];
 		if (rest.len == 0)
 		{
@@ -55,11 +67,13 @@ fn bool parse_server_reference(String reference, String* host, int* port, int de
 		if (colons == 0)
 		{
 			*host = first;
+			if (!plain(*host)) return false;
 			*port = default_port;
 			return true;
 		}
 		if (at == 0) return false;
 		*host = first[:at];
+		if (!plain(*host)) return false;
 		rest = first[at + 1..];
 	}
 	if (rest.len == 0 || rest.len > 5) return false;
@@ -71,5 +85,15 @@ fn bool parse_server_reference(String reference, String* host, int* port, int de
 	}
 	if (value < 1 || value > 65_535) return false;
 	*port = value;
+	return true;
+}
+
+// No control characters (below 0x21, or DEL) in a host.
+fn bool plain(String host) @private
+{
+	foreach (c : host)
+	{
+		if (c < 0x21 || c == 0x7F) return false;
+	}
 	return true;
 }

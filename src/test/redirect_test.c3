@@ -42,3 +42,21 @@ fn void server_reference_parse_table() @test
 		if (ok) assert(host == row.host && port == row.port, "host and port");
 	}
 }
+
+// a reference that is refused leaves the outputs untouched, and control characters are not part of a host
+fn void server_reference_failure_does_not_touch_the_outputs() @test
+{
+	String[*] bad = { "[::1]x", "[::1]:99999", "host:99999", "host\t:80", "[::1]:", "bad\x00host" };
+	foreach (text : bad)
+	{
+		String host = "untouched";
+		int port = 4242;
+		bool ok = redirect::parse_server_reference(text, &host, &port, 1883);
+		assert(!ok, "refused");
+		assert(host == "untouched" && port == 4242, "outputs unchanged after a refusal");
+	}
+	String host;
+	int port;
+	assert(!redirect::parse_server_reference("host\x7F", &host, &port, 1883), "DEL in a host");
+	assert(!redirect::parse_server_reference("ho\x01st", &host, &port, 1883), "control character in a host");
+}
