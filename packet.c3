@@ -157,6 +157,12 @@ fn void? check_binary(char[] b) @private
 	if (b.len > mqtt::MAX_STRING_LENGTH) return mqtt::INVALID_ARGUMENT~;
 }
 
+fn void? check_filter(String filter) @private
+{
+	wire::validate_utf8(filter)!;
+	if (filter.len == 0) return mqtt::INVALID_TOPIC_FILTER~;
+}
+
 fn char qos_bits(QoS q) @private => (char)q.ordinal;
 
 fn QoS? qos_from_bits(char bits) @private
@@ -179,6 +185,7 @@ fn bool is_ack_type(PacketType t) @private
 
 // Decodes one complete frame (exactly the bytes frame_length reported). Strings and payloads
 // borrow from `frame`. Only 3.1.1 is implemented in this step; 5.0 comes with the property codec.
+// Packet type 15 is PROTOCOL_ERROR in 3.1.1.
 fn Packet? decode(Version v, char[] frame)
 {
 	usz n = frame_length(frame, 0)!;
@@ -226,10 +233,31 @@ fn Packet? decode311(char first, char[] body) @private
 			if (flags != 2) return mqtt::MALFORMED_PACKET~;
 			p.type = PacketType.PUBREL;
 			p.ack = decode_ack(body)!;
-		case 15:
-			return mqtt::PROTOCOL_ERROR~;   // reserved in 3.1.1
+		case 8:
+			if (flags != 2) return mqtt::MALFORMED_PACKET~;
+			p.type = PacketType.SUBSCRIBE;
+			p.subscribe = decode_subscribe(body)!;
+		case 9:
+			if (flags != 0) return mqtt::MALFORMED_PACKET~;
+			p.type = PacketType.SUBACK;
+			p.suback = decode_suback(body)!;
+		case 10:
+			if (flags != 2) return mqtt::MALFORMED_PACKET~;
+			p.type = PacketType.UNSUBSCRIBE;
+			p.unsubscribe = decode_unsubscribe(body)!;
+		case 11:
+			if (flags != 0) return mqtt::MALFORMED_PACKET~;
+			p.type = PacketType.UNSUBACK;
+			if (body.len != 2) return mqtt::MALFORMED_PACKET~;   // 3.1.1: the id and nothing else
+			p.suback.packet_id = (ushort)body[0] << 8 | (ushort)body[1];
+			if (p.suback.packet_id == 0) return mqtt::MALFORMED_PACKET~;
+		case 12:
+		case 13:
+		case 14:
+			if (flags != 0 || body.len != 0) return mqtt::MALFORMED_PACKET~;
+			p.type = (PacketType)type;
 		default:
-			return mqtt::INVALID_ARGUMENT~; // packet types handled by the next codec step
+			return mqtt::PROTOCOL_ERROR~;   // type 15 is reserved in 3.1.1
 	}
 	return p;
 }
@@ -321,9 +349,88 @@ fn Ack? decode_ack(char[] body) @private
 	return { .packet_id = id };
 }
 
+fn ushort? read_id(ByteReader* r) @private
+{
+	ushort id = r.u16()!;
+	if (id == 0) return mqtt::MALFORMED_PACKET~;
+	return id;
+}
+
+fn Subscribe? decode_subscribe(char[] body) @private
+{
+	ByteReader r = wire::reader(body);
+	Subscribe s;
+	s.packet_id = read_id(&r)!;
+	s.raw = r.rest();
+	if (s.raw.len == 0) return mqtt::MALFORMED_PACKET~;           // at least one filter
+	// check every entry now so that Subscribe.next cannot fail later
+	usz cursor;
+	SubEntry entry;
+	while (s.next(&cursor, Version.V311, &entry)!) {}
+	return s;
+}
+
+fn SubAck? decode_suback(char[] body) @private
+{
+	ByteReader r = wire::reader(body);
+	SubAck s;
+	s.packet_id = read_id(&r)!;
+	s.codes = r.rest();
+	if (s.codes.len == 0) return mqtt::MALFORMED_PACKET~;
+	foreach (c : s.codes)
+	{
+		if (c > 2 && c != mqtt::SUBACK_FAILURE_311) return mqtt::MALFORMED_PACKET~;
+	}
+	return s;
+}
+
+fn Unsubscribe? decode_unsubscribe(char[] body) @private
+{
+	ByteReader r = wire::reader(body);
+	Unsubscribe u;
+	u.packet_id = read_id(&r)!;
+	u.raw = r.rest();
+	if (u.raw.len == 0) return mqtt::MALFORMED_PACKET~;
+	usz cursor;
+	String f;
+	while (u.next(&cursor, &f)!) {}
+	return u;
+}
+
+// Walks the filters of a decoded SUBSCRIBE (3.1.1 option byte: QoS in bits 0-1, the rest zero).
+// Returns false at the end. Faults: MALFORMED_PACKET, INVALID_UTF8, INVALID_TOPIC_FILTER (empty).
+// Only 3.1.1 is implemented in this step.
+fn bool? Subscribe.next(&self, usz* cursor, Version v, SubEntry* out)
+{
+	if (v != Version.V311) return mqtt::UNSUPPORTED_VERSION~;
+	if (*cursor >= self.raw.len) return false;
+	ByteReader r = { .data = self.raw, .pos = *cursor };
+	String filter = r.string()!;
+	if (filter.len == 0) return mqtt::INVALID_TOPIC_FILTER~;
+	char opt = r.u8()!;
+	if (opt & 0xFC != 0 || opt & 3 == 3) return mqtt::MALFORMED_PACKET~;
+	*out = { .filter = filter, .qos = qos_from_bits(opt & 3)! };
+	*cursor = r.pos;
+	return true;
+}
+
+// Walks the filters of a decoded UNSUBSCRIBE. Returns false at the end.
+fn bool? Unsubscribe.next(&self, usz* cursor, String* out)
+{
+	if (*cursor >= self.raw.len) return false;
+	ByteReader r = { .data = self.raw, .pos = *cursor };
+	String filter = r.string()!;
+	if (filter.len == 0) return mqtt::INVALID_TOPIC_FILTER~;
+	*out = filter;
+	*cursor = r.pos;
+	return true;
+}
+
 // ---- encode ----
 
 // Exact encoded size of the whole frame; validates the packet (topics, strings, flags, ids).
+// A SUBSCRIBE / UNSUBSCRIBE without `entries` / `filters` is encoded from its `raw` body, so a
+// decoded packet encodes back to the same bytes.
 // INVALID_ARGUMENT for contents the protocol forbids, PACKET_TOO_LARGE above the 268_435_455 limit.
 fn usz? encoded_size(Version v, Packet* p)
 {
@@ -384,8 +491,55 @@ fn usz? body_size(Version v, Packet* p) @private
 		case PacketType.PUBCOMP:
 			if (p.ack.packet_id == 0) return mqtt::INVALID_ARGUMENT~;
 			return 2;
+		case PacketType.SUBSCRIBE:
+			Subscribe* s = &p.subscribe;
+			if (s.packet_id == 0) return mqtt::INVALID_ARGUMENT~;
+			if (s.entries.len == 0)
+			{
+				// a decoded packet: encode the entries it carries (already validated by decode)
+				if (s.raw.len == 0) return mqtt::INVALID_ARGUMENT~;
+				return 2 + s.raw.len;
+			}
+			usz n = 2;
+			foreach (e : s.entries)
+			{
+				check_filter(e.filter)!;
+				if (e.no_local || e.retain_as_published || e.retain_handling != 0) return mqtt::INVALID_ARGUMENT~;
+				n += 2 + e.filter.len + 1;
+			}
+			return n;
+		case PacketType.SUBACK:
+			SubAck* a = &p.suback;
+			if (a.packet_id == 0 || a.codes.len == 0) return mqtt::INVALID_ARGUMENT~;
+			foreach (c : a.codes)
+			{
+				if (c > 2 && c != mqtt::SUBACK_FAILURE_311) return mqtt::INVALID_ARGUMENT~;
+			}
+			return 2 + a.codes.len;
+		case PacketType.UNSUBSCRIBE:
+			Unsubscribe* u = &p.unsubscribe;
+			if (u.packet_id == 0) return mqtt::INVALID_ARGUMENT~;
+			if (u.filters.len == 0)
+			{
+				if (u.raw.len == 0) return mqtt::INVALID_ARGUMENT~;
+				return 2 + u.raw.len;
+			}
+			usz n = 2;
+			foreach (f : u.filters)
+			{
+				check_filter(f)!;
+				n += 2 + f.len;
+			}
+			return n;
+		case PacketType.UNSUBACK:
+			if (p.suback.packet_id == 0) return mqtt::INVALID_ARGUMENT~;
+			return 2;
+		case PacketType.PINGREQ:
+		case PacketType.PINGRESP:
+		case PacketType.DISCONNECT:
+			return 0;
 		default:
-			return mqtt::INVALID_ARGUMENT~;   // packet types handled by the next codec step
+			return mqtt::INVALID_ARGUMENT~;   // AUTH does not exist in 3.1.1
 	}
 }
 
@@ -416,6 +570,38 @@ fn usz? encode(Version v, Packet* p, char[] out)
 			encode_ack(&w, 0x62, p.ack.packet_id)!;
 		case PacketType.PUBCOMP:
 			encode_ack(&w, 0x70, p.ack.packet_id)!;
+		case PacketType.SUBSCRIBE:
+			w.u8(0x82)!;
+			w.vbi((uint)rl)!;
+			w.u16(p.subscribe.packet_id)!;
+			if (p.subscribe.entries.len == 0) w.raw(p.subscribe.raw)!;
+			foreach (e : p.subscribe.entries)
+			{
+				w.string(e.filter)!;
+				w.u8(qos_bits(e.qos))!;
+			}
+		case PacketType.SUBACK:
+			w.u8(0x90)!;
+			w.vbi((uint)rl)!;
+			w.u16(p.suback.packet_id)!;
+			w.raw(p.suback.codes)!;
+		case PacketType.UNSUBSCRIBE:
+			w.u8(0xA2)!;
+			w.vbi((uint)rl)!;
+			w.u16(p.unsubscribe.packet_id)!;
+			if (p.unsubscribe.filters.len == 0) w.raw(p.unsubscribe.raw)!;
+			foreach (f : p.unsubscribe.filters) w.string(f)!;
+		case PacketType.UNSUBACK:
+			encode_ack(&w, 0xB0, p.suback.packet_id)!;
+		case PacketType.PINGREQ:
+			w.u8(0xC0)!;
+			w.vbi(0)!;
+		case PacketType.PINGRESP:
+			w.u8(0xD0)!;
+			w.vbi(0)!;
+		case PacketType.DISCONNECT:
+			w.u8(0xE0)!;
+			w.vbi(0)!;
 		default:
 			return mqtt::INVALID_ARGUMENT~;
 	}
