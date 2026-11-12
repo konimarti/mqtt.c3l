@@ -112,7 +112,7 @@ enum EventKind : char
 	UNSUBSCRIBED,   // UNSUBACK
 	AUTH,           // AUTH packet received, no hook (or hook returned CONTINUE)
 	CLOSED,         // connection ended: server DISCONNECT, error, or our DISCONNECT flushed;
-	// always delivered after every event queued before it (DESIGN 4.12)
+	// always delivered after every event queued before it
 	PONG,           // PINGRESP (informational)
 }
 
@@ -176,7 +176,7 @@ struct AuthInfo
 
 // Acknowledgements (PUBACK, PUBREC) are queued inside input(), in arrival order, never at poll_event.
 // Event data is borrowed from the core input buffer and stays valid until the first
-// input() that follows the event queue being drained (poll_event returned false); undelivered events are never invalidated (DESIGN section 7).
+// input() that follows the event queue being drained (poll_event returned false); undelivered events are never invalidated.
 struct Event
 {
 	EventKind kind;
