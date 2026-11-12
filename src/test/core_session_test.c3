@@ -585,3 +585,26 @@ fn void pubrel_is_not_sent_twice_for_a_waiting_record() @test
 	assert(s.core.inflight_count() == 0);
 	s.close();
 }
+
+// the rule is about the interval of the CONNECT, whatever the server answers
+fn void disconnect_expiry_check_uses_the_connect_value() @test
+{
+	// CONNECT 0, the server grants 60: a DISCONNECT still may not ask for a non-zero value
+	Session s;
+	Config c = cfg(Version.V5);
+	c.session_expiry = 0;
+	s.open(&c, "20 08 00 00 05 11 00 00 00 3C");
+	Properties p;
+	p.set(PropId.SESSION_EXPIRY_INTERVAL);
+	p.session_expiry = 30;
+	assert(@catch(s.core.disconnect(s.clock.now, ReasonCode.NORMAL_DISCONNECTION, &p)) == mqtt::INVALID_ARGUMENT);
+	s.close();
+	// CONNECT 100, the server grants 0: a DISCONNECT may set a new interval
+	Session t;
+	Config d = cfg(Version.V5);
+	d.session_expiry = 100;
+	t.open(&d, "20 08 00 00 05 11 00 00 00 00");
+	t.core.disconnect(t.clock.now, ReasonCode.NORMAL_DISCONNECTION, &p)!!;
+	harness::expect_out(&t.core, "E0 07 00 05 11 00 00 00 1E");
+	t.close();
+}

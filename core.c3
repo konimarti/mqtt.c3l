@@ -933,9 +933,8 @@ fn void? Core.disconnect(&self, Duration now, ReasonCode reason, Properties* pro
 			d.disconnect.props = *props;
 			if (props.has(PropId.SESSION_EXPIRY_INTERVAL))
 			{
-				// [5.0 3.14.2.2.2]: a session that ends with the connection cannot be kept alive by DISCONNECT
-				uint now_expiry = self.reached_connected ? self.limits.session_expiry : self.config.session_expiry;
-				if (now_expiry == 0 && props.session_expiry != 0) return mqtt::INVALID_ARGUMENT~;
+				// [5.0 3.14.2.2.2]: if the CONNECT said 0 (whatever the server granted), DISCONNECT cannot ask for more
+				if (self.config.session_expiry == 0 && props.session_expiry != 0) return mqtt::INVALID_ARGUMENT~;
 				new_expiry = true;
 			}
 		}
