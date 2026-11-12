@@ -506,6 +506,8 @@ fn void? Emit.subids(&self, Properties* p, PropContext ctx)
 {
 	if (p.subscription_ids.len > 0)
 	{
+		// a SUBSCRIBE carries at most one Subscription Identifier
+		if (ctx == PropContext.SUBSCRIBE && p.subscription_ids.len > 1) return mqtt::INVALID_PROPERTY~;
 		foreach (v : p.subscription_ids)
 		{
 			if (v == 0) return mqtt::INVALID_PROPERTY~;

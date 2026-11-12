@@ -601,3 +601,19 @@ fn void stress_10000_user_properties() @test
 	while (it.next(&u)!!) count++;
 	assert(count == 10_000);
 }
+
+fn void encode_allows_one_subscription_identifier_in_subscribe() @test
+{
+	uint[2] two = { 5, 6 };
+	Properties p;
+	p.subscription_ids = two[..];
+	assert(@catch(props::properties_size(&p, PropContext.SUBSCRIBE)) == mqtt::INVALID_PROPERTY);
+	char[16] buf;
+	ByteWriter w = wire::writer(buf[..]);
+	assert(@catch(w.properties(&p, PropContext.SUBSCRIBE)) == mqtt::INVALID_PROPERTY);
+	assert(w.pos == 0, "nothing written");
+	// several are fine in a PUBLISH, one is fine in a SUBSCRIBE
+	assert(props::properties_size(&p, PropContext.PUBLISH)!! == 1 + 2 + 2);
+	p.subscription_ids = two[:1];
+	assert(props::properties_size(&p, PropContext.SUBSCRIBE)!! == 1 + 2);
+}
