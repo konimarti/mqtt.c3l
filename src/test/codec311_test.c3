@@ -614,3 +614,21 @@ fn void v5_is_not_implemented_yet() @test
 {
 	assert(@catch(packet::decode(Version.V5, hx("C0 00"))) == mqtt::UNSUPPORTED_VERSION);
 }
+
+// encode sizes the packet once: the limit is checked on the remaining length before any byte is written
+fn void encode_limit_and_size_agree() @test
+{
+	// a slice that claims more than the protocol allows (never read: the size check comes first)
+	char[1] one = { 0x61 };
+	char[] huge = one[:1];
+	Packet p = { .type = PacketType.PUBLISH };
+	p.publish = { .topic = "t", .payload = huge };
+	char[16] small;
+	small[..] = 0x55;
+	// small buffer: BUFFER_TOO_SMALL and nothing written
+	char[2] tiny;
+	assert(@catch(packet::encode(Version.V311, &p, tiny[..])) == mqtt::BUFFER_TOO_SMALL);
+	usz n = packet::encode(Version.V311, &p, small[..])!!;
+	assert(n == packet::encoded_size(Version.V311, &p)!!, "encode and encoded_size agree");
+	assert(n == 1 + 1 + 2 + 1 + 1);
+}

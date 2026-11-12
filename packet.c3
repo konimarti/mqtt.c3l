@@ -548,7 +548,8 @@ fn usz? body_size(Version v, Packet* p) @private
 fn usz? encode(Version v, Packet* p, char[] out)
 {
 	usz rl = body_size(v, p)!;
-	usz total = encoded_size(v, p)!;
+	if (rl > mqtt::MAX_REMAINING_LENGTH) return mqtt::PACKET_TOO_LARGE~;
+	usz total = 1 + wire::vbi_size((uint)rl) + rl;
 	if (out.len < total) return mqtt::BUFFER_TOO_SMALL~;
 	ByteWriter w = wire::writer(out[:total]);
 	switch (p.type)
