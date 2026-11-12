@@ -31,4 +31,3 @@ fn char[] hex(String s)
 	}
 	return out[:n];
 }
-
