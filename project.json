@@ -2,11 +2,11 @@
 	"authors": [ "Koni Marti <koni.marti@gmail.com>" ],
 	"version": "0.1.0",
 	"output": "build",
-	"sources": [ "./*", "src/test/**" ],
+	"sources": [ "./*", "src/test/**", "src/mqttc/args.c3" ],
 	"targets": {
 		"mqttc": {
 			"type": "executable",
-			"sources": [ "src/mqttc/**" ]
+			"sources": [ "src/mqttc/main.c3" ]
 		}
 	}
 }

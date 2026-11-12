@@ -1,5 +1,4 @@
 module mqttc::args;
-// (lives under src/test so that the unit tests and the mqttc target both compile it)
 import mqtt, mqtt::topic;
 import std::math::random;
 
