@@ -12,6 +12,9 @@ on:
         required: false
         default: "v0.8.6"
 
+permissions:
+  contents: read
+
 env:
   C3_VERSION: ${{ github.event.inputs.version || 'v0.8.6' }}
   PAHO_COMMIT: fdab9d2b1ce125385135e5d9f282a0ad315268cc
@@ -19,13 +22,14 @@ env:
 jobs:
   build-linux:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install c3c
         run: |
           curl -fsSL -o c3.tar.gz "https://github.com/c3lang/c3c/releases/download/${C3_VERSION}/c3-linux.tar.gz"
-          mkdir -p "$HOME/c3" && tar -xzf c3.tar.gz -C "$HOME/c3" --strip-components=1
-          echo "$HOME/c3" >> "$GITHUB_PATH"
+          mkdir -p "$HOME/c3" && tar -xzf c3.tar.gz -C "$HOME/c3"
+          echo "$(dirname "$(find "$HOME/c3" -name c3c -type f | head -1)")" >> "$GITHUB_PATH"
       - name: Version
         run: c3c --version
       - name: Unit tests
@@ -36,27 +40,25 @@ jobs:
         run: c3c build mqttc
       - name: Build itest
         run: c3c build itest
-      - name: Format check
-        run: |
-          # c3f is built from the formatter repository when it is not part of the release
-          if command -v c3f >/dev/null 2>&1; then c3f --check *.c3 src/*/*.c3; else echo "c3f not available: skipped"; fi
-      - name: Peer tests, Paho interoperability broker (does not block yet)
-        continue-on-error: true
+      - name: Peer runner checks
+        run: python3 tools/test_peer.py
+      - name: Peer tests, Paho interoperability broker
         run: |
           mkdir -p .work/peer
           git clone https://github.com/eclipse/paho.mqtt.testing .work/peer/paho
           git -C .work/peer/paho checkout "$PAHO_COMMIT"
-          python3 tools/peer.py --kind paho --version 3.1.1
-          python3 tools/peer.py --kind paho --version 5
-      - name: Peer tests, mosquitto from apt (does not block yet; the runner has no mosquitto kind so far)
+          python3 tools/peer.py --kind paho --version 3.1.1 --require-pass
+          python3 tools/peer.py --kind paho --version 5 --require-pass
+      - name: Peer tests, mosquitto from apt (does not block until it has run once)
         continue-on-error: true
         run: |
           sudo apt-get update && sudo apt-get install -y mosquitto
-          python3 tools/peer.py --kind mosquitto --version 3.1.1
-          python3 tools/peer.py --kind mosquitto --version 5
+          python3 tools/peer.py --kind mosquitto --version 3.1.1 --require-pass
+          python3 tools/peer.py --kind mosquitto --version 5 --require-pass
 
   build-macos:
     runs-on: macos-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install c3c
@@ -76,11 +78,12 @@ jobs:
         continue-on-error: true
         run: |
           brew install mosquitto
-          python3 tools/peer.py --kind mosquitto --version 3.1.1
-          python3 tools/peer.py --kind mosquitto --version 5
+          python3 tools/peer.py --kind mosquitto --version 3.1.1 --require-pass
+          python3 tools/peer.py --kind mosquitto --version 5 --require-pass
 
   build-windows:
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install c3c
