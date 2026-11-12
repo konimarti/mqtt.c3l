@@ -160,10 +160,17 @@ def run_itest(args, broker, *extra):
                MQTT_PEER_RUN=str(os.getpid()))
     cmd = [os.path.join(ROOT, "build", "itest"), "--version", args.version] + list(extra)
     kw = {"start_new_session": True} if POSIX else {}
-    p = subprocess.Popen(cmd, env=env, cwd=ROOT, **kw)
+    p = subprocess.Popen(cmd, env=env, cwd=ROOT, stdout=subprocess.PIPE, text=True, **kw)
     CHILDREN.append(p)
     try:
-        return p.wait(timeout=args.timeout)
+        deadline = time.time() + args.timeout
+        for line in p.stdout:                       # shown as they come, and counted
+            print(line, end="", flush=True)
+            if line.startswith("PASS "):
+                args.passed += 1
+            if time.time() > deadline:
+                raise subprocess.TimeoutExpired(cmd, args.timeout)
+        return p.wait(timeout=max(1, deadline - time.time()))
     except subprocess.TimeoutExpired:
         stop(p)
         print("FAIL %s-timeout the scenarios took longer than %d s" % (args.group_now, args.timeout))
@@ -174,6 +181,22 @@ def run_itest(args, broker, *extra):
 
 def run_group(args, group):
     args.group_now = group
+    before = args.passed
+    rc = run_group_body(args, group)
+    # a group in which nothing passed proves nothing: with --require-pass that is a failure, except where a broker
+    # is allowed to be unable to do it (the restart needs persistence; 3.1.1 has no limits to speak of)
+    if rc == 0 and nothing_passed(args, group, before):
+        print("FAIL %s-nothing-passed every scenario of the group was skipped" % group)
+        return 1
+    return rc
+
+
+def nothing_passed(args, group, passed_before):
+    exempt = group == "restart" or (group == "limits" and args.version == "3.1.1")
+    return args.require_pass and args.passed == passed_before and not exempt
+
+
+def run_group_body(args, group):
     with tempfile.TemporaryDirectory(prefix="mqtt-peer-") as tmp:
         broker = Broker(args, group, tmp)
         try:
@@ -204,7 +227,9 @@ def main():
     ap.add_argument("--version", default="5", choices=["3.1.1", "5"])
     ap.add_argument("--group", default="all", choices=["all"] + list(GROUPS))
     ap.add_argument("--timeout", type=int, default=300)
+    ap.add_argument("--require-pass", action="store_true", help="fail a group in which no scenario passed")
     args = ap.parse_args()
+    args.passed = 0
     if not os.path.exists(os.path.join(ROOT, "build", "itest")) and not os.path.exists(os.path.join(ROOT, "build", "itest.exe")):
         sys.exit("peer.py: build/itest is missing; run `c3c build itest` first")
     signal.signal(signal.SIGTERM, on_term)
@@ -219,7 +244,8 @@ def main():
     except KeyboardInterrupt:
         print("interrupted")
         return 130
-    print("RESULT %s version %s: %s" % (args.kind, args.version, "no FAIL" if failed == 0 else "%d group(s) with FAIL" % failed))
+    print("RESULT %s version %s: %d passed, %s" % (args.kind, args.version, args.passed,
+                                                    "no FAIL" if failed == 0 else "%d group(s) with FAIL" % failed))
     return 0 if failed == 0 else 1
 
 

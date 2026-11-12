@@ -12,6 +12,27 @@ def run(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, timeout=60, **kw)
 
 
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import peer
+
+
+class Args:
+    def __init__(self, version, passed, require):
+        self.version, self.passed, self.require_pass = version, passed, require
+
+
+class RequirePass(unittest.TestCase):
+    def test_a_group_where_everything_was_skipped_fails_when_a_pass_is_required(self):
+        self.assertTrue(peer.nothing_passed(Args("5", 7, True), "basic", 7))
+        self.assertFalse(peer.nothing_passed(Args("5", 8, True), "basic", 7), "something passed")
+        self.assertFalse(peer.nothing_passed(Args("5", 7, False), "basic", 7), "not required")
+
+    def test_groups_that_may_skip_everything(self):
+        self.assertFalse(peer.nothing_passed(Args("5", 7, True), "restart", 7))
+        self.assertFalse(peer.nothing_passed(Args("3.1.1", 7, True), "limits", 7))
+        self.assertTrue(peer.nothing_passed(Args("5", 7, True), "limits", 7))
+
+
 @unittest.skipUnless(os.path.exists(ITEST), "build/itest is missing")
 class PeerRunner(unittest.TestCase):
     def test_missing_broker_is_a_skip_not_a_failure(self):
