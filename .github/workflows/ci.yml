@@ -19,20 +19,30 @@ env:
   C3_VERSION: ${{ github.event.inputs.version || 'v0.8.6' }}
   PAHO_COMMIT: fdab9d2b1ce125385135e5d9f282a0ad315268cc
 
+# every run step is bash, also on Windows (Git for Windows); the c3c install on Windows is the one PowerShell step
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build-linux:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
       - name: Install c3c
         run: |
           curl -fsSL -o c3.tar.gz "https://github.com/c3lang/c3c/releases/download/${C3_VERSION}/c3-linux.tar.gz"
           mkdir -p "$HOME/c3" && tar -xzf c3.tar.gz -C "$HOME/c3"
           echo "$(dirname "$(find "$HOME/c3" -name c3c -type f | head -1)")" >> "$GITHUB_PATH"
-      - name: Version
-        run: c3c --version
-      - name: Unit tests
+      - name: Versions
+        run: |
+          c3c --version
+          python3 --version
+      - name: Unit tests (include version_matches_project_json)
         run: c3c test
       - name: Unit tests with AddressSanitizer
         run: c3c test --sanitize=address
@@ -40,6 +50,15 @@ jobs:
         run: c3c build mqttc
       - name: Build itest
         run: c3c build itest
+      - name: Bump tool compiles and changes both places
+        run: |
+          d="$RUNNER_TEMP/bump"
+          mkdir -p "$d"
+          cp project.json mqtt.c3 "$d/"
+          c3c compile tools/bump_version.c3 -o "$d/bump"
+          (cd "$d" && ./bump 9.8.7)
+          grep -q '"version": "9.8.7"' "$d/project.json"
+          grep -q 'const String VERSION = "9.8.7";' "$d/mqtt.c3"
       - name: Peer runner checks
         run: python3 tools/test_peer.py
       - name: Peer tests, Paho interoperability broker
@@ -47,12 +66,14 @@ jobs:
           mkdir -p .work/peer
           git clone https://github.com/eclipse/paho.mqtt.testing .work/peer/paho
           git -C .work/peer/paho checkout "$PAHO_COMMIT"
+          git -C .work/peer/paho log -1 --format=%H
           python3 tools/peer.py --kind paho --version 3.1.1 --require-pass
           python3 tools/peer.py --kind paho --version 5 --require-pass
       - name: Peer tests, mosquitto from apt (does not block until it has run once)
         continue-on-error: true
         run: |
           sudo apt-get update && sudo apt-get install -y mosquitto
+          mosquitto -h 2>&1 | head -1 || true
           python3 tools/peer.py --kind mosquitto --version 3.1.1 --require-pass
           python3 tools/peer.py --kind mosquitto --version 5 --require-pass
 
@@ -60,15 +81,22 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
       - name: Install c3c
         run: |
           curl -fsSL -o c3.zip "https://github.com/c3lang/c3c/releases/download/${C3_VERSION}/c3-macos.zip"
           mkdir -p "$HOME/c3" && unzip -q c3.zip -d "$HOME/c3"
-          echo "$(dirname "$(find "$HOME/c3" -name c3c -type f | head -1)")" >> "$GITHUB_PATH"
-      - name: Version
-        run: c3c --version
-      - name: Unit tests
+          bin="$(find "$HOME/c3" -name c3c -type f | head -1)"
+          chmod +x "$bin"
+          echo "$(dirname "$bin")" >> "$GITHUB_PATH"
+      - name: Versions
+        run: |
+          c3c --version
+          python3 --version
+      - name: Unit tests (include version_matches_project_json)
         run: c3c test
       - name: Build mqttc
         run: c3c build mqttc
@@ -78,6 +106,7 @@ jobs:
         continue-on-error: true
         run: |
           brew install mosquitto
+          mosquitto -h 2>&1 | head -1 || true
           python3 tools/peer.py --kind mosquitto --version 3.1.1 --require-pass
           python3 tools/peer.py --kind mosquitto --version 5 --require-pass
 
@@ -85,17 +114,17 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install c3c
         shell: pwsh
         run: |
           Invoke-WebRequest -Uri "https://github.com/c3lang/c3c/releases/download/$env:C3_VERSION/c3-windows.zip" -OutFile c3.zip
           Expand-Archive c3.zip -DestinationPath "$HOME\c3"
           $dir = (Get-ChildItem "$HOME\c3" -Recurse -Filter c3c.exe | Select-Object -First 1).DirectoryName
-          Add-Content $env:GITHUB_PATH $dir
+          Add-Content -Path $env:GITHUB_PATH -Value $dir
       - name: Version
         run: c3c --version
-      - name: Unit tests
+      - name: Unit tests (include version_matches_project_json)
         run: c3c test
       - name: Build mqttc
         run: c3c build mqttc
