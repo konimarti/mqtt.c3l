@@ -1,41 +1,9 @@
 module mqtt::wire_test;
-import mqtt, mqtt::wire;
-
-// "80 01" -> bytes. Test helper: hex pairs separated by spaces.
-fn char[] hex(String s)
-{
-	char[] out = mem::temp_array(char, s.len / 2 + 1);
-	usz n;
-	int hi = -1;
-	foreach (c : s)
-	{
-		int v;
-		if (c >= '0' && c <= '9')
-		{
-			v = c - '0';
-		}
-		else if (c >= 'A' && c <= 'F')
-		{
-			v = c - 'A' + 10;
-		}
-		else if (c >= 'a' && c <= 'f')
-		{
-			v = c - 'a' + 10;
-		}
-		else
-		{
-			continue;
-		}
-		if (hi < 0) { hi = v; continue; }
-		out[n++] = (char)(hi * 16 + v);
-		hi = -1;
-	}
-	return out[:n];
-}
+import mqtt, mqtt::wire, mqtt::testutil;
 
 fn void check_vbi(String h, uint value)
 {
-	char[] b = hex(h);
+	char[] b = testutil::hex(h);
 	usz used;
 	uint v = wire::vbi_decode(b, &used)!!;
 	assert(v == value, "decoded value");
@@ -50,7 +18,7 @@ fn void check_vbi(String h, uint value)
 fn void expect_vbi_fault(String h, fault expected)
 {
 	usz used;
-	fault f = @catch(wire::vbi_decode(hex(h), &used));
+	fault f = @catch(wire::vbi_decode(testutil::hex(h), &used));
 	assert(f == expected, "wrong fault");
 }
 
@@ -85,7 +53,7 @@ fn void vbi_non_minimal_longer() @test
 fn void vbi_consumes_only_its_bytes() @test
 {
 	usz used;
-	uint v = wire::vbi_decode(hex("E8 07 C0 00"), &used)!!;
+	uint v = wire::vbi_decode(testutil::hex("E8 07 C0 00"), &used)!!;
 	assert(v == 1000 && used == 2);
 }
 
@@ -115,13 +83,13 @@ fn void vbi_round_trip_boundaries() @test
 
 fn void expect_utf8_ok(String h)
 {
-	char[] b = hex(h);
+	char[] b = testutil::hex(h);
 	assert(!@catch(wire::validate_utf8((String)b)), "should be valid");
 }
 
 fn void expect_utf8_bad(String h)
 {
-	char[] b = hex(h);
+	char[] b = testutil::hex(h);
 	assert(@catch(wire::validate_utf8((String)b)) == mqtt::INVALID_UTF8, "should be invalid");
 }
 
@@ -132,7 +100,7 @@ fn void vec_V_STR_4() @test { expect_utf8_ok("EF BF BF"); }
 fn void vec_V_STR_5() @test
 {
 	// byte order mark is a plain character: valid, and the bytes are returned as they are
-	char[] framed = hex("00 03 EF BB BF");
+	char[] framed = testutil::hex("00 03 EF BB BF");
 	ByteReader r = wire::reader(framed);
 	String s = r.string()!!;
 	assert(s.len == 3 && s[0] == 0xEF && s[1] == 0xBB && s[2] == 0xBF);
@@ -150,12 +118,12 @@ fn void vec_V_STR_N10() @test { expect_utf8_bad("E0 80 80"); }
 fn void vec_V_STR_N11() @test
 {
 	// length prefix 9, only 2 bytes follow
-	ByteReader r = wire::reader(hex("00 09 61 62"));
+	ByteReader r = wire::reader(testutil::hex("00 09 61 62"));
 	assert(@catch(r.string()) == mqtt::INCOMPLETE);
 }
 fn void vec_V_STR_N12() @test
 {
-	ByteReader r = wire::reader(hex("00 05 61"));
+	ByteReader r = wire::reader(testutil::hex("00 05 61"));
 	assert(@catch(r.string()) == mqtt::INCOMPLETE);
 }
 
@@ -190,7 +158,7 @@ fn void utf8_length_limit() @test
 
 fn void reader_big_endian() @test
 {
-	ByteReader r = wire::reader(hex("12 34 AB CD EF 01 02"));
+	ByteReader r = wire::reader(testutil::hex("12 34 AB CD EF 01 02"));
 	assert(r.u8()!! == 0x12);
 	assert(r.u8()!! == 0x34);
 	assert(r.u16()!! == 0xABCD);
@@ -199,14 +167,14 @@ fn void reader_big_endian() @test
 	assert(r.pos == 4, "a failed read consumes nothing");
 	assert(r.u8()!! == 0xEF);
 	assert(r.rest().len == 2);
-	ByteReader r2 = wire::reader(hex("01 02 03 04"));
+	ByteReader r2 = wire::reader(testutil::hex("01 02 03 04"));
 	assert(r2.u32()!! == 0x01020304);
 	assert(@catch(r2.u8()) == mqtt::INCOMPLETE);
 }
 
 fn void reader_string_and_binary() @test
 {
-	ByteReader r = wire::reader(hex("00 03 61 2F 62 00 02 FF 00 00 00 DE"));
+	ByteReader r = wire::reader(testutil::hex("00 03 61 2F 62 00 02 FF 00 00 00 DE"));
 	String s = r.string()!!;
 	assert(s == "a/b");
 	char[] b = r.binary()!!;
@@ -219,20 +187,20 @@ fn void reader_string_and_binary() @test
 
 fn void reader_string_rejects_bad_utf8_without_consuming() @test
 {
-	ByteReader r = wire::reader(hex("00 02 C0 80 00 01 41"));
+	ByteReader r = wire::reader(testutil::hex("00 02 C0 80 00 01 41"));
 	assert(@catch(r.string()) == mqtt::INVALID_UTF8);
 	assert(r.pos == 0);
 }
 
 fn void reader_take_and_vbi() @test
 {
-	ByteReader r = wire::reader(hex("E8 07 01 02 03"));
+	ByteReader r = wire::reader(testutil::hex("E8 07 01 02 03"));
 	assert(r.vbi()!! == 1000);
 	char[] t = r.take(2)!!;
 	assert(t.len == 2 && t[0] == 1 && t[1] == 2);
 	assert(@catch(r.take(2)) == mqtt::INCOMPLETE);
 	assert(r.pos == 4);
-	ByteReader bad = wire::reader(hex("80 00"));
+	ByteReader bad = wire::reader(testutil::hex("80 00"));
 	assert(@catch(bad.vbi()) == mqtt::MALFORMED_PACKET);
 	assert(bad.pos == 0);
 }
@@ -246,8 +214,8 @@ fn void writer_big_endian() @test
 	w.u32(0x01020304)!!;
 	w.vbi(1000)!!;
 	w.string("a/b")!!;
-	w.binary(hex("FF 00"))!!;
-	assert(w.written() == hex("12 AB CD 01 02 03 04 E8 07 00 03 61 2F 62 00 02 FF 00"));
+	w.binary(testutil::hex("FF 00"))!!;
+	assert(w.written() == testutil::hex("12 AB CD 01 02 03 04 E8 07 00 03 61 2F 62 00 02 FF 00"));
 }
 
 fn void writer_buffer_too_small() @test
@@ -259,22 +227,22 @@ fn void writer_buffer_too_small() @test
 	assert(w.pos == 2, "a failed write writes nothing");
 	assert(@catch(w.u32(1)) == mqtt::BUFFER_TOO_SMALL);
 	assert(@catch(w.string("abc")) == mqtt::BUFFER_TOO_SMALL);
-	assert(@catch(w.raw(hex("01 02"))) == mqtt::BUFFER_TOO_SMALL);
+	assert(@catch(w.raw(testutil::hex("01 02"))) == mqtt::BUFFER_TOO_SMALL);
 	assert(@catch(w.vbi(300)) == mqtt::BUFFER_TOO_SMALL);
 	w.u8(9)!!;
 	assert(@catch(w.u8(9)) == mqtt::BUFFER_TOO_SMALL);
-	assert(w.written() == hex("01 02 09"));
+	assert(w.written() == testutil::hex("01 02 09"));
 }
 
 fn void writer_string_validation() @test
 {
 	char[64] buf;
 	ByteWriter w = wire::writer(buf[..]);
-	assert(@catch(w.string((String)hex("C0 80"))) == mqtt::INVALID_UTF8);
+	assert(@catch(w.string((String)testutil::hex("C0 80"))) == mqtt::INVALID_UTF8);
 	assert(w.pos == 0);
 	assert(@catch(w.vbi(268_435_456)) == mqtt::INVALID_ARGUMENT);
 	w.string("")!!;
-	assert(w.written() == hex("00 00"));
+	assert(w.written() == testutil::hex("00 00"));
 }
 
 fn void writer_string_length_limit() @test
@@ -297,11 +265,11 @@ fn void reader_writer_round_trip() @test
 	w.u16(7)!!;
 	w.string("héllo")!!;
 	w.vbi(321)!!;
-	w.binary(hex("00 01 02"))!!;
+	w.binary(testutil::hex("00 01 02"))!!;
 	ByteReader r = wire::reader(w.written());
 	assert(r.u16()!! == 7);
 	assert(r.string()!! == "héllo");
 	assert(r.vbi()!! == 321);
-	assert(r.binary()!! == hex("00 01 02"));
+	assert(r.binary()!! == testutil::hex("00 01 02"));
 	assert(r.remaining() == 0);
 }
